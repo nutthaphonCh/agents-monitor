@@ -13,8 +13,8 @@ All tools use the Python 3 standard library or macOS system commands. Agent cred
 ## Install from a release tar
 
 ```sh
-tar -xzf tools-0.2.2.tar.gz
-cd tools-0.2.2
+tar -xzf tools-0.2.3.tar.gz
+cd tools-0.2.3
 scripts/install.sh
 ```
 
@@ -36,9 +36,9 @@ curl --proto '=https' --tlsv1.2 --fail --location \
   --netrc-file <(printf 'machine api.github.com\nlogin token\npassword %s\n' "$GITHUB_TOKEN") \
   -H 'Accept: application/vnd.github.raw+json' \
   -o /tmp/bootstrap-tools.sh \
-  'https://api.github.com/repos/nutthaphonCh/tools/contents/scripts/bootstrap-private-release.sh?ref=v0.2.2'
+  'https://api.github.com/repos/nutthaphonCh/tools/contents/scripts/bootstrap-private-release.sh?ref=v0.2.3'
 chmod 700 /tmp/bootstrap-tools.sh
-/tmp/bootstrap-tools.sh --version 0.2.2
+/tmp/bootstrap-tools.sh --version 0.2.3
 ```
 
 The bootstrap keeps the token out of curl's argument list, downloads the release tar and checksum through the GitHub Contents API, verifies SHA-256, extracts into a temporary directory, and runs its installer. It does not create a Git checkout.
@@ -47,11 +47,11 @@ The bootstrap keeps the token out of curl's argument list, downloads the release
 
 Run `agent-monitor`, select a prompt in a Claude or Codex session, and press `p` to open every Claude, Codex, or AGY agent spawned by that prompt. Agents are scoped to both the selected session and prompt, grouped into active and finished sections, and ordinary yielded shell commands are excluded.
 
-Press Enter or Right Arrow for process detail. Tab switches between the realtime response, logs, and metadata; `f` toggles follow mode; Left Arrow returns to the process list.
+The list shows local started and finished times plus elapsed duration. Press Enter or Right Arrow for process detail. Tab switches between the realtime response, logs, and metadata; `f` toggles follow mode; Left Arrow returns to the process list.
 
 ## Development
 
 ```sh
 python3 -m unittest tests.test_monitoring
-scripts/build-release.sh 0.2.2
+scripts/build-release.sh 0.2.3
 ```

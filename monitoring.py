@@ -1876,6 +1876,11 @@ def process_elapsed(actor: Actor) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
 
 
+def process_clock(timestamp: str | None) -> str:
+    parsed = parse_iso_timestamp(timestamp)
+    return parsed.astimezone().strftime("%H:%M:%S") if parsed else "--:--:--"
+
+
 def fit_action_bar(full: str, compact: str, width: int) -> str:
     available = max(1, width - 1)
     value = full if len(full) <= available else compact
@@ -2303,10 +2308,14 @@ class TTYApp:
             for index, (prompt, actor) in enumerate(processes):
                 group = "ACTIVE" if actor.status in ACTIVE_PROCESS_STATES else "FINISHED"
                 if group != previous_group:
-                    rendered.append((-1, group))
+                    rendered.append((-1, f"{group:<8}  ENGINE   STATUS      STARTED   FINISHED  ELAPSED"))
                     previous_group = group
                 engine = (actor.engine or "process")[:8]
-                rendered.append((index, f"{engine:<8} {actor.status:<10} {process_elapsed(actor):>8}  {actor.label}  · prompt {prompt.index}"))
+                rendered.append((index, (
+                    f"{engine:<8} {actor.status:<10} {process_clock(actor.started_at)} "
+                    f"{process_clock(actor.finished_at)} {process_elapsed(actor):>8}  "
+                    f"{actor.label}  · prompt {prompt.index}"
+                )))
             visible_height = max(1, body_height - 2)
             selected_row = next((i for i, (index, _) in enumerate(rendered) if index == self.process_cursor), 0)
             if selected_row < self.process_offset:

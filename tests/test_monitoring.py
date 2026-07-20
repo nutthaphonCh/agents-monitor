@@ -593,6 +593,12 @@ class TTYIntegrationTests(unittest.TestCase):
 
 
 class FrameAffordanceTests(unittest.TestCase):
+    def test_process_clock_renders_local_started_and_finished_times(self):
+        timestamp = "2026-07-20T10:11:12+00:00"
+        expected = monitoring.parse_iso_timestamp(timestamp).astimezone().strftime("%H:%M:%S")
+        self.assertEqual(monitoring.process_clock(timestamp), expected)
+        self.assertEqual(monitoring.process_clock(None), "--:--:--")
+
     def test_process_view_is_scoped_to_selected_prompt(self):
         first = monitoring.PromptTurn(1, "first", 1, "2026-07-20T10:00:00Z")
         first.actors.append(monitoring.Actor("a", "Claude one", "completed", engine="claude"))
