@@ -4,7 +4,7 @@ Standalone host tooling for Claude Code, Codex, and AGY workflows.
 
 ## Included
 
-- `agent-monitor`: terminal session profiler for Claude Code and Codex, including spawned Codex and AGY/Gemini actors
+- `agent-monitor`: terminal session profiler for Claude Code and Codex, including spawned Claude, Codex, and AGY/Gemini background processes
 - `codex-telemetry`: summarize Codex JSONL execution telemetry
 - `install-apple-container`: pinned, checksum-verified Apple Container host installer
 
@@ -13,8 +13,8 @@ All tools use the Python 3 standard library or macOS system commands. Agent cred
 ## Install from a release tar
 
 ```sh
-tar -xzf tools-0.1.0.tar.gz
-cd tools-0.1.0
+tar -xzf tools-0.2.0.tar.gz
+cd tools-0.2.0
 scripts/install.sh
 ```
 
@@ -36,16 +36,22 @@ curl --proto '=https' --tlsv1.2 --fail --location \
   --netrc-file <(printf 'machine api.github.com\nlogin token\npassword %s\n' "$GITHUB_TOKEN") \
   -H 'Accept: application/vnd.github.raw+json' \
   -o /tmp/bootstrap-tools.sh \
-  'https://api.github.com/repos/nutthaphonCh/tools/contents/scripts/bootstrap-private-release.sh?ref=v0.1.0'
+  'https://api.github.com/repos/nutthaphonCh/tools/contents/scripts/bootstrap-private-release.sh?ref=v0.2.0'
 chmod 700 /tmp/bootstrap-tools.sh
-/tmp/bootstrap-tools.sh --version 0.1.0
+/tmp/bootstrap-tools.sh --version 0.2.0
 ```
 
 The bootstrap keeps the token out of curl's argument list, downloads the release tar and checksum through the GitHub Contents API, verifies SHA-256, extracts into a temporary directory, and runs its installer. It does not create a Git checkout.
+
+## Background processes
+
+Run `agent-monitor`, select a Claude or Codex session, and press `p` to open every background process observed in that session. Processes are grouped into active and finished sections.
+
+Press Enter or Right Arrow for process detail. Tab switches between the realtime response, logs, and metadata; `f` toggles follow mode; Left Arrow returns to the process list.
 
 ## Development
 
 ```sh
 python3 -m unittest tests.test_monitoring
-scripts/build-release.sh 0.1.0
+scripts/build-release.sh 0.2.0
 ```

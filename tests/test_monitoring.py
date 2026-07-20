@@ -593,6 +593,71 @@ class TTYIntegrationTests(unittest.TestCase):
 
 
 class FrameAffordanceTests(unittest.TestCase):
+    def test_p_opens_session_processes_and_realtime_detail(self):
+        session = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".jsonl", prefix="rollout-", delete=False, encoding="utf-8",
+        )
+        result = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        result.write("first response line\nsecond response line\n")
+        result.close()
+        records = [
+            codex_records()[0], codex_records()[1], codex_records()[2], codex_records()[3],
+            {"type": "response_item", "timestamp": "2026-07-20T10:00:02Z", "payload": {
+                "type": "custom_tool_call", "call_id": "bg-call", "name": "exec",
+                "input": 'const r = await tools.exec_command({"cmd":"scripts/spawn/spawn-claude.sh --project /repo"});',
+            }},
+            {"type": "response_item", "timestamp": "2026-07-20T10:00:03Z", "payload": {
+                "type": "custom_tool_call_output", "call_id": "bg-call",
+                "output": "Script running with cell ID cell-42",
+            }},
+        ]
+        try:
+            for record in records:
+                session.write(json.dumps(record) + "\n")
+            session.close()
+
+            class Screen:
+                def getmaxyx(self):
+                    return 24, 120
+
+            app = monitoring.TTYApp(Screen(), session.name)
+            app.refresh(force=True)
+            app.handle_key(ord("p"))
+            self.assertEqual(app.mode, "processes")
+            rows = [line for line, _ in app.frame()]
+            self.assertTrue(any("1 active" in line for line in rows))
+            self.assertTrue(any("claude" in line and "running" in line for line in rows))
+            app.handle_key(monitoring.curses.KEY_RIGHT)
+            self.assertEqual(app.mode, "process_detail")
+
+            with open(session.name, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "type": "response_item", "timestamp": "2026-07-20T10:00:04Z",
+                    "payload": {"type": "function_call", "call_id": "wait-call", "name": "wait",
+                                "arguments": json.dumps({"cell_id": "cell-42"})},
+                }) + "\n")
+                fh.write(json.dumps({
+                    "type": "response_item", "timestamp": "2026-07-20T10:00:05Z",
+                    "payload": {"type": "function_call_output", "call_id": "wait-call",
+                                "output": f"output={result.name}\nexit_code=0"},
+                }) + "\n")
+            app.refresh(force=True)
+            prompt, actor = app.selected_process()
+            self.assertEqual(actor.status, "completed")
+            self.assertEqual(actor.exit_code, 0)
+            self.assertEqual(actor.output_path, result.name)
+            detail = [line for line, _ in app.frame()]
+            self.assertTrue(any("second response line" in line for line in detail))
+            app.handle_key(9)
+            self.assertEqual(app.process_tab, "logs")
+            app.handle_key(9)
+            self.assertEqual(app.process_tab, "metadata")
+        finally:
+            if not session.closed:
+                session.close()
+            os.unlink(session.name)
+            os.unlink(result.name)
+
     def test_search_matches_are_remapped_when_switching_views(self):
         records = []
         for index in range(6):

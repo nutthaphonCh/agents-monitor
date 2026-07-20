@@ -11,6 +11,7 @@ Keys
   [           previous session
   ]           next session
   z / x       Claude / Codex sessions
+  p           background processes for the current session
   Up / Down   move between prompts
   Right/Enter open; Left/Esc back
   PgUp/PgDn   scroll one page
@@ -50,7 +51,7 @@ from typing import Any
 
 
 REFRESH_INTERVAL = 0.5
-CACHE_SCHEMA_VERSION = 5
+CACHE_SCHEMA_VERSION = 6
 ESCAPE_DELAY_MS = 25
 ACTION_NAMES = (
     "WebSearch", "WebFetch", "Bash", "Write", "Edit", "Read", "Glob", "Grep", "Search",
@@ -141,6 +142,9 @@ class Actor:
     verdict: str | None = None
     decision: str | None = None
     rationale: str | None = None
+    output_path: str | None = None
+    events_path: str | None = None
+    log_chunks: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -899,8 +903,14 @@ def enrich_record(
                 attach_codex_telemetry(telemetry_path, result_text, tools_by_id)
             actor = actor_for_tool(owner, tool_id)
             if actor:
+                if result_text.strip():
+                    actor.log_chunks.append(result_text)
                 task_match = re.search(r"background with ID:\s*([\w-]+)", result_text, re.I)
                 wrapper_exit = re.search(r"(?:^|\n)exit_code=(-?\d+)(?:\n|$)", result_text)
+                for field_name, attr_name in (("output", "output_path"), ("events", "events_path"), ("telemetry", "telemetry_path")):
+                    match = re.search(rf"(?:^|\n){field_name}=([^\n]+)", result_text)
+                    if match:
+                        setattr(actor, attr_name, match.group(1).strip())
                 if wrapper_exit:
                     actor.exit_code = int(wrapper_exit.group(1))
                 if task_match:
@@ -933,6 +943,7 @@ def enrich_record(
         actor.finished_at = timestamp
         actor.task_id = task_match.group(1).strip() if task_match else actor.task_id
         actor.exit_code = int(exit_match.group(1)) if exit_match else None
+        actor.log_chunks.append(text)
         load_actor_telemetry(actor)
         owner.timeline.append(TimelineItem(timestamp, f"Actor · {actor.label} — {actor.status}", "actor"))
         owner.evidence_chars["tool output"] += local_token_weight(text)
@@ -1205,8 +1216,8 @@ class CodexSessionAnalyzer:
             call_id = str(payload.get("call_id") or payload.get("id") or self.sequence)
             prompt.timeline.append(TimelineItem(timestamp, f"{activity} — started", "tool"))
             self.pending_actions.append(activity)
-            self.tools[call_id] = (prompt, activity, {})
             command = codex_exec_command(payload) if action == "Bash" else ""
+            self.tools[call_id] = (prompt, activity, {"command": command})
             if is_agy_command(command):
                 label = f"Gemini · {description or 'Antigravity review'}"
                 prompt.actors.append(Actor(
@@ -1230,8 +1241,26 @@ class CodexSessionAnalyzer:
                 category = "repository" if activity.startswith(("Read ·", "Glob ·", "Grep ·")) else "tool output"
                 owner.evidence_chars[category] += local_token_weight(result_text)
                 actor = actor_for_tool(owner, call_id)
+                cell = re.search(r"Script running with cell ID\s+([\w-]+)", result_text)
+                if cell and not actor:
+                    command = str(linked[2].get("command") or "")
+                    engine = (
+                        "claude" if "spawn-claude" in command or "claude-background-bridge" in command
+                        else "codex" if "spawn-codex" in command or "spawn-advise" in command
+                        else "agy" if is_agy_command(command)
+                        else "shell"
+                    )
+                    label = activity.split(" · ", 1)[-1] or "Background process"
+                    actor = Actor(
+                        call_id, label, "running", timestamp, task_id=cell.group(1),
+                        tool_use_id=call_id, engine=engine,
+                    )
+                    owner.actors.append(actor)
+                    self.pending_cells[cell.group(1)] = actor
+                    owner.timeline.append(TimelineItem(timestamp, f"Actor · {label} — started", "actor"))
+                if actor and result_text.strip():
+                    actor.log_chunks.append(result_text)
                 if actor and actor.engine == "agy":
-                    cell = re.search(r"Script running with cell ID\s+([\w-]+)", result_text)
                     if cell:
                         actor.task_id = cell.group(1)
                         self.pending_cells[cell.group(1)] = actor
@@ -1245,16 +1274,21 @@ class CodexSessionAnalyzer:
             except json.JSONDecodeError:
                 arguments = {}
             cell_id = str(arguments.get("cell_id") or "")
-            self.tools[call_id] = (prompt, "Wait · AGY", {"cell_id": cell_id})
+            self.tools[call_id] = (prompt, "Wait · process", {"cell_id": cell_id})
             return
         if kind == "function_call_output":
             call_id = str(payload.get("call_id") or "")
             linked = self.tools.get(call_id)
-            if linked and linked[1] == "Wait · AGY":
+            if linked and linked[1] == "Wait · process":
                 owner, _, inputs = linked
-                actor = self.pending_cells.pop(str(inputs.get("cell_id") or ""), None)
+                cell_id = str(inputs.get("cell_id") or "")
+                actor = self.pending_cells.get(cell_id)
                 if actor:
-                    self._complete_agy_actor(actor, codex_function_output_text(payload), timestamp, owner)
+                    output = codex_function_output_text(payload)
+                    actor.log_chunks.append(output)
+                    if "Script running with cell ID" not in output:
+                        self.pending_cells.pop(cell_id, None)
+                        self._complete_background_actor(actor, output, timestamp, owner)
             return
         if kind == "agent_message":
             prompt.evidence_chars["conversation"] += local_token_weight(str(payload.get("message") or ""))
@@ -1296,6 +1330,21 @@ class CodexSessionAnalyzer:
         actor.status = "failed" if actor.exit_code not in {None, 0} else "completed"
         actor.finished_at = timestamp
         load_agy_decision(actor)
+        owner.timeline.append(TimelineItem(timestamp, f"Actor · {actor.label} — {actor.status}", "actor"))
+
+    def _complete_background_actor(
+        self, actor: Actor, result_text: str, timestamp: str | None, owner: PromptTurn,
+    ) -> None:
+        wrapper_exit = re.search(r"(?:exit_code=|\"exit_code\"\s*:\s*)(-?\d+)", result_text)
+        actor.exit_code = int(wrapper_exit.group(1)) if wrapper_exit else None
+        actor.status = "failed" if actor.exit_code not in {None, 0} else "completed"
+        actor.finished_at = timestamp
+        for field_name, attr_name in (("output", "output_path"), ("events", "events_path"), ("telemetry", "telemetry_path")):
+            match = re.search(rf"(?:^|\n){field_name}=([^\n]+)", result_text)
+            if match:
+                setattr(actor, attr_name, match.group(1).strip())
+        if actor.engine == "agy":
+            load_agy_decision(actor)
         owner.timeline.append(TimelineItem(timestamp, f"Actor · {actor.label} — {actor.status}", "actor"))
 
 
@@ -1721,6 +1770,82 @@ def actor_detail_lines(actor: Actor) -> list[str]:
     return lines
 
 
+ACTIVE_PROCESS_STATES = {"starting", "running", "waiting"}
+
+
+def session_processes(analysis: Analysis) -> list[tuple[PromptTurn, Actor]]:
+    processes = [(prompt, actor) for prompt in analysis.prompts for actor in prompt.actors]
+    return sorted(
+        processes,
+        key=lambda item: (
+            0 if item[1].status in ACTIVE_PROCESS_STATES else 1,
+            item[1].started_at or "",
+        ),
+    )
+
+
+def actor_file(actor: Actor, value: str | None) -> Path | None:
+    if not value or "$" in value:
+        return None
+    path = Path(value).expanduser()
+    if not path.is_absolute() and actor.working_dir:
+        path = Path(actor.working_dir) / path
+    return path
+
+
+def tail_text(path: Path | None, limit: int = 128_000) -> str:
+    if not path:
+        return ""
+    try:
+        with path.open("rb") as fh:
+            size = fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, size - limit))
+            return fh.read().decode(errors="replace")
+    except OSError:
+        return ""
+
+
+def actor_log_lines(actor: Actor) -> list[str]:
+    text = tail_text(actor_file(actor, actor.events_path))
+    chunks = [chunk for chunk in actor.log_chunks if chunk.strip()]
+    if text.strip():
+        chunks.append(text)
+    lines = [line for chunk in chunks for line in chunk.rstrip().splitlines()]
+    return lines or ["No log output observed yet."]
+
+
+def actor_response_lines(actor: Actor) -> list[str]:
+    result = tail_text(actor_file(actor, actor.output_path))
+    if result.strip():
+        return result.rstrip().splitlines()
+    response: list[str] = []
+    for line in actor_log_lines(actor):
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "assistant" and isinstance(event.get("text"), str):
+            response.extend(event["text"].splitlines())
+        item = event.get("item") if isinstance(event.get("item"), dict) else {}
+        if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
+            response.extend(item["text"].splitlines())
+    return response or ["No realtime response observed yet."]
+
+
+def process_elapsed(actor: Actor) -> str:
+    started = parse_iso_timestamp(actor.started_at)
+    if not started:
+        return "--:--"
+    finished = parse_iso_timestamp(actor.finished_at)
+    now = dt.datetime.now(dt.timezone.utc)
+    seconds = max(0, int(((finished or now) - started).total_seconds()))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+
+
 def fit_action_bar(full: str, compact: str, width: int) -> str:
     available = max(1, width - 1)
     value = full if len(full) <= available else compact
@@ -1774,6 +1899,10 @@ class TTYApp:
         self.detail_offset = 0
         self.detail_page = "prompt"
         self.detail_cursor = 0
+        self.process_cursor = 0
+        self.process_offset = 0
+        self.process_tab = "response"
+        self.process_follow = True
         self.selected_prompt = 1
         self.search_query = ""
         self.search_matches: list[int] = []
@@ -1916,6 +2045,13 @@ class TTYApp:
     def selected_prompt_turn(self) -> PromptTurn | None:
         return next((p for p in self.analysis.prompts if p.index == self.selected_prompt), None)
 
+    def selected_process(self) -> tuple[PromptTurn, Actor] | None:
+        processes = session_processes(self.analysis)
+        if not processes:
+            return None
+        self.process_cursor = max(0, min(self.process_cursor, len(processes) - 1))
+        return processes[self.process_cursor]
+
     def open_detail_selection(self) -> None:
         prompt = self.selected_prompt_turn()
         if not prompt:
@@ -1997,10 +2133,46 @@ class TTYApp:
             if key in (27, curses.KEY_LEFT, ord("?"), ord("q")):
                 self.mode = "list"
             return True
+        if self.mode in {"processes", "process_detail"}:
+            if key == ord("q"):
+                return False
+            if key == ord("p"):
+                self.mode = "list"
+            elif key in (27, curses.KEY_LEFT):
+                self.mode = "processes" if self.mode == "process_detail" else "list"
+            elif self.mode == "processes":
+                count = len(session_processes(self.analysis))
+                if key == curses.KEY_DOWN:
+                    self.process_cursor = min(max(0, count - 1), self.process_cursor + 1)
+                elif key == curses.KEY_UP:
+                    self.process_cursor = max(0, self.process_cursor - 1)
+                elif key in (10, 13, curses.KEY_ENTER, curses.KEY_RIGHT) and count:
+                    self.mode, self.process_tab, self.process_offset = "process_detail", "response", 0
+            else:
+                if key == 9:
+                    tabs = ("response", "logs", "metadata")
+                    self.process_tab = tabs[(tabs.index(self.process_tab) + 1) % len(tabs)]
+                    self.process_offset = 0
+                elif key == ord("f"):
+                    self.process_follow = not self.process_follow
+                elif key == curses.KEY_DOWN:
+                    self.process_follow = False
+                    self.process_offset += 1
+                elif key == curses.KEY_UP:
+                    self.process_follow = False
+                    self.process_offset = max(0, self.process_offset - 1)
+                elif key == curses.KEY_HOME:
+                    self.process_follow, self.process_offset = False, 0
+                elif key == curses.KEY_END:
+                    self.process_follow = True
+            return True
         if key == ord("q"):
             return False
         if key == ord("z"):
             self.select_provider("claude")
+            return True
+        if key == ord("p") and self.mode == "list":
+            self.mode, self.process_cursor, self.process_offset = "processes", 0, 0
             return True
         if key == ord("x"):
             self.select_provider("codex")
@@ -2087,7 +2259,68 @@ class TTYApp:
         session = f"Session {self.session_index + 1}/{len(self.session_paths)} · {provider} · {Path(self.path).stem} · {self.status}"
         rows.append((truncate(session, width - 1), 0))
 
-        if self.mode == "detail":
+        if self.mode == "processes":
+            processes = session_processes(self.analysis)
+            active = sum(actor.status in ACTIVE_PROCESS_STATES for _, actor in processes)
+            rows.append((f" Background processes · {active} active · {len(processes) - active} finished", curses.A_BOLD))
+            rows.append(("", 0))
+            rendered: list[tuple[int, str]] = []
+            previous_group = ""
+            for index, (prompt, actor) in enumerate(processes):
+                group = "ACTIVE" if actor.status in ACTIVE_PROCESS_STATES else "FINISHED"
+                if group != previous_group:
+                    rendered.append((-1, group))
+                    previous_group = group
+                engine = (actor.engine or "process")[:8]
+                rendered.append((index, f"{engine:<8} {actor.status:<10} {process_elapsed(actor):>8}  {actor.label}  · prompt {prompt.index}"))
+            visible_height = max(1, body_height - 2)
+            selected_row = next((i for i, (index, _) in enumerate(rendered) if index == self.process_cursor), 0)
+            if selected_row < self.process_offset:
+                self.process_offset = selected_row
+            elif selected_row >= self.process_offset + visible_height:
+                self.process_offset = selected_row - visible_height + 1
+            for index, line in rendered[self.process_offset:self.process_offset + visible_height]:
+                rows.append((
+                    ("> " if index >= 0 else "  ") + truncate_layout(line, width - 3),
+                    curses.A_REVERSE if index == self.process_cursor else (curses.A_BOLD if index < 0 else 0),
+                ))
+            if not processes:
+                rows.append(("  No background processes observed in this session.", 0))
+            footer = fit_action_bar(
+                " PROCESSES │ ↑/↓ select │ → detail │ p/← back │ q quit",
+                " PROCESSES │ ↑/↓ │ → detail │ p back",
+                width,
+            )
+        elif self.mode == "process_detail":
+            selected = self.selected_process()
+            if selected:
+                prompt, actor = selected
+                tabs = "  ".join(f"[{name}]" if name == self.process_tab else name for name in ("response", "logs", "metadata"))
+                rows.append((truncate_layout(f" {actor.engine or 'process'} · {actor.label} · {actor.status} · {process_elapsed(actor)}", width - 1), curses.A_BOLD))
+                rows.append((f" {tabs}", 0))
+                if self.process_tab == "response":
+                    lines = actor_response_lines(actor)
+                elif self.process_tab == "logs":
+                    lines = actor_log_lines(actor)
+                else:
+                    lines = actor_detail_lines(actor) + ["", f"Prompt       {prompt.index}", f"Output       {actor.output_path or '-'}", f"Events       {actor.events_path or '-'}"]
+                visible_height = max(1, body_height - 2)
+                max_offset = max(0, len(lines) - visible_height)
+                if self.process_follow and self.process_tab in {"response", "logs"}:
+                    self.process_offset = max_offset
+                else:
+                    self.process_offset = min(self.process_offset, max_offset)
+                for line in lines[self.process_offset:self.process_offset + visible_height]:
+                    rows.append(("  " + truncate_layout(line, width - 3), 0))
+            else:
+                rows.append(("  Process not found", 0))
+            follow = "follow" if self.process_follow else "paused"
+            footer = fit_action_bar(
+                f" PROCESS DETAIL │ Tab view │ f {follow} │ ↑/↓ scroll │ ← back",
+                f" DETAIL │ Tab │ f {follow} │ ← back",
+                width,
+            )
+        elif self.mode == "detail":
             prompt = self.selected_prompt_turn()
             if prompt and self.detail_page.startswith("actor:"):
                 actor_key = self.detail_page.split(":", 1)[1]
@@ -2150,6 +2383,7 @@ class TTYApp:
                 "]           Next session",
                 "z           Claude sessions",
                 "x           Codex sessions",
+                "p           Background processes for this session",
                 "/           Search current view",
                 "n / N       Next / previous search result",
                 "q           Quit",
@@ -2180,21 +2414,21 @@ class TTYApp:
                 ))
             if self.view == 1 and self.follow:
                 footer = fit_action_bar(
-                    " FOLLOW │ ↑/↓ prompt │ → open │ / search │ ? help │ q quit",
-                    " FOLLOW │ ↑/↓ │ → open │ / │ ? │ q",
+                    " FOLLOW │ ↑/↓ prompt │ → open │ p processes │ / search │ ? help │ q quit",
+                    " FOLLOW │ ↑/↓ │ → open │ p processes │ / │ ? │ q",
                     width,
                 )
             elif self.view == 1:
                 updates = f"{self.new_events} updates │ " if self.new_events else ""
                 footer = fit_action_bar(
-                    f" PAUSED │ {updates}End follow │ ↑/↓ prompt │ → open │ / search │ ? help │ q quit",
-                    f" PAUSED │ {updates}End follow │ → open │ / │ ? │ q",
+                    f" PAUSED │ {updates}End follow │ ↑/↓ prompt │ → open │ p processes │ / search │ ? help │ q quit",
+                    f" PAUSED │ {updates}End follow │ → open │ p processes │ / │ ? │ q",
                     width,
                 )
             else:
                 footer = fit_action_bar(
-                    " HISTORY │ ↑/↓ prompt │ → open │ / search │ ? help │ q quit",
-                    " HISTORY │ ↑/↓ │ → open │ / │ ? │ q",
+                    " HISTORY │ ↑/↓ prompt │ → open │ p processes │ / search │ ? help │ q quit",
+                    " HISTORY │ ↑/↓ │ → open │ p processes │ / │ ? │ q",
                     width,
                 )
 
