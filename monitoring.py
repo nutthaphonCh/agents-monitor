@@ -51,7 +51,7 @@ from typing import Any
 
 
 REFRESH_INTERVAL = 0.5
-CACHE_SCHEMA_VERSION = 6
+CACHE_SCHEMA_VERSION = 7
 ESCAPE_DELAY_MS = 25
 ACTION_NAMES = (
     "WebSearch", "WebFetch", "Bash", "Write", "Edit", "Read", "Glob", "Grep", "Search",
@@ -730,6 +730,43 @@ def is_agy_command(command: str) -> bool:
     return False
 
 
+def spawned_agent_engine(command: str) -> str | None:
+    """Return the managed agent engine, excluding ordinary yielded shell commands."""
+    if is_agy_command(command):
+        return "agy"
+    script_engines = {
+        "spawn-claude.sh": "claude",
+        "claude-background-bridge.py": "claude",
+        "claude-background-bridge.mjs": "claude",
+        "spawn-codex.sh": "codex",
+        "spawn-advise.sh": "codex",
+    }
+    for segment in re.split(r"&&|\|\||[;|\n]", command):
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            continue
+        tokens = [token for token in tokens if not re.match(r"^[A-Za-z_]\w*=", token)]
+        if not tokens:
+            continue
+        executable = Path(tokens[0]).name
+        candidate = executable
+        candidate_index = 0
+        if executable in {"bash", "sh", "zsh"}:
+            if "-n" in tokens[1:]:
+                continue
+            candidate_index = next((index for index, token in enumerate(tokens[1:], 1) if not token.startswith("-")), -1)
+            candidate = Path(tokens[candidate_index]).name if candidate_index >= 0 else ""
+        elif executable.startswith("python"):
+            candidate_index = next((index for index, token in enumerate(tokens[1:], 1) if not token.startswith("-")), -1)
+            candidate = Path(tokens[candidate_index]).name if candidate_index >= 0 else ""
+        engine = script_engines.get(candidate)
+        invocation_args = tokens[candidate_index + 1:] if candidate_index >= 0 else []
+        if engine and not any(flag in invocation_args for flag in ("--help", "-h", "--dry-run")):
+            return engine
+    return None
+
+
 def command_option(command: str, option: str) -> str | None:
     match = re.search(
         rf"{re.escape(option)}(?:=|\s+)(?:\"([^\"]+)\"|'([^']+)'|([^\s;&|]+))",
@@ -1218,13 +1255,15 @@ class CodexSessionAnalyzer:
             self.pending_actions.append(activity)
             command = codex_exec_command(payload) if action == "Bash" else ""
             self.tools[call_id] = (prompt, activity, {"command": command})
-            if is_agy_command(command):
-                label = f"Gemini · {description or 'Antigravity review'}"
+            engine = spawned_agent_engine(command)
+            if engine:
+                display_name = {"agy": "Gemini", "claude": "Claude", "codex": "Codex"}[engine]
+                label = f"{display_name} · {description or 'Background agent'}"
                 prompt.actors.append(Actor(
                     call_id, label, "running", timestamp,
                     tool_use_id=call_id,
                     working_dir=command_option(command, "--project") or "",
-                    engine="agy", model=agy_model(command),
+                    engine=engine, model=agy_model(command) if engine == "agy" else None,
                 ))
                 prompt.timeline.append(TimelineItem(timestamp, f"Actor · {label} — started", "actor"))
             path_match = re.search(r"(?:/Users/|/private/|/tmp/)[^\s\"']+", str(payload.get("input") or ""))
@@ -1242,30 +1281,14 @@ class CodexSessionAnalyzer:
                 owner.evidence_chars[category] += local_token_weight(result_text)
                 actor = actor_for_tool(owner, call_id)
                 cell = re.search(r"Script running with cell ID\s+([\w-]+)", result_text)
-                if cell and not actor:
-                    command = str(linked[2].get("command") or "")
-                    engine = (
-                        "claude" if "spawn-claude" in command or "claude-background-bridge" in command
-                        else "codex" if "spawn-codex" in command or "spawn-advise" in command
-                        else "agy" if is_agy_command(command)
-                        else "shell"
-                    )
-                    label = activity.split(" · ", 1)[-1] or "Background process"
-                    actor = Actor(
-                        call_id, label, "running", timestamp, task_id=cell.group(1),
-                        tool_use_id=call_id, engine=engine,
-                    )
-                    owner.actors.append(actor)
-                    self.pending_cells[cell.group(1)] = actor
-                    owner.timeline.append(TimelineItem(timestamp, f"Actor · {label} — started", "actor"))
                 if actor and result_text.strip():
                     actor.log_chunks.append(result_text)
-                if actor and actor.engine == "agy":
+                if actor:
                     if cell:
                         actor.task_id = cell.group(1)
                         self.pending_cells[cell.group(1)] = actor
                     else:
-                        self._complete_agy_actor(actor, result_text, timestamp, owner)
+                        self._complete_background_actor(actor, result_text, timestamp, owner)
             return
         if kind == "function_call" and payload.get("name") == "wait":
             call_id = str(payload.get("call_id") or payload.get("id") or self.sequence)
@@ -2262,7 +2285,7 @@ class TTYApp:
         if self.mode == "processes":
             processes = session_processes(self.analysis)
             active = sum(actor.status in ACTIVE_PROCESS_STATES for _, actor in processes)
-            rows.append((f" Background processes · {active} active · {len(processes) - active} finished", curses.A_BOLD))
+            rows.append((f" Spawned background agents · {active} active · {len(processes) - active} finished", curses.A_BOLD))
             rows.append(("", 0))
             rendered: list[tuple[int, str]] = []
             previous_group = ""
@@ -2285,7 +2308,7 @@ class TTYApp:
                     curses.A_REVERSE if index == self.process_cursor else (curses.A_BOLD if index < 0 else 0),
                 ))
             if not processes:
-                rows.append(("  No background processes observed in this session.", 0))
+                rows.append(("  No spawned background agents observed in this session.", 0))
             footer = fit_action_bar(
                 " PROCESSES │ ↑/↓ select │ → detail │ p/← back │ q quit",
                 " PROCESSES │ ↑/↓ │ → detail │ p back",
@@ -2383,7 +2406,7 @@ class TTYApp:
                 "]           Next session",
                 "z           Claude sessions",
                 "x           Codex sessions",
-                "p           Background processes for this session",
+                "p           Spawned background agents for this session",
                 "/           Search current view",
                 "n / N       Next / previous search result",
                 "q           Quit",

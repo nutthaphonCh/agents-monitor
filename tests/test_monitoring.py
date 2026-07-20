@@ -593,6 +593,36 @@ class TTYIntegrationTests(unittest.TestCase):
 
 
 class FrameAffordanceTests(unittest.TestCase):
+    def test_yielded_shell_commands_are_not_background_agents(self):
+        records = [
+            codex_records()[0], codex_records()[1], codex_records()[2], codex_records()[3],
+            {"type": "response_item", "timestamp": "2026-07-20T10:00:02Z", "payload": {
+                "type": "custom_tool_call", "call_id": "shell-call", "name": "exec",
+                "input": 'const r = await tools.exec_command({"cmd":"python3 -m unittest"});',
+            }},
+            {"type": "response_item", "timestamp": "2026-07-20T10:00:03Z", "payload": {
+                "type": "custom_tool_call_output", "call_id": "shell-call",
+                "output": "Script running with cell ID cell-shell",
+            }},
+        ]
+        fixture = SessionFixture(records)
+        try:
+            analysis = monitoring.CodexSessionAnalyzer(fixture.path).analysis
+            self.assertEqual(monitoring.session_processes(analysis), [])
+        finally:
+            fixture.close()
+
+    def test_spawn_engine_requires_execution_not_a_script_reference(self):
+        self.assertIsNone(monitoring.spawned_agent_engine("chmod +x scripts/spawn/spawn-claude.sh"))
+        self.assertIsNone(monitoring.spawned_agent_engine("bash -n scripts/spawn/spawn-codex.sh"))
+        self.assertIsNone(monitoring.spawned_agent_engine("rg spawn-claude.sh scripts"))
+        self.assertIsNone(monitoring.spawned_agent_engine("scripts/spawn/spawn-codex.sh --help"))
+        self.assertIsNone(monitoring.spawned_agent_engine("scripts/spawn/spawn-claude.sh --dry-run"))
+        self.assertEqual(
+            monitoring.spawned_agent_engine("bash scripts/spawn/spawn-claude.sh --project /repo"),
+            "claude",
+        )
+
     def test_p_opens_session_processes_and_realtime_detail(self):
         session = tempfile.NamedTemporaryFile(
             mode="w", suffix=".jsonl", prefix="rollout-", delete=False, encoding="utf-8",
