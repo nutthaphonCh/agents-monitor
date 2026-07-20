@@ -593,6 +593,17 @@ class TTYIntegrationTests(unittest.TestCase):
 
 
 class FrameAffordanceTests(unittest.TestCase):
+    def test_process_view_is_scoped_to_selected_prompt(self):
+        first = monitoring.PromptTurn(1, "first", 1, "2026-07-20T10:00:00Z")
+        first.actors.append(monitoring.Actor("a", "Claude one", "completed", engine="claude"))
+        second = monitoring.PromptTurn(2, "second", 2, "2026-07-20T10:01:00Z")
+        second.actors.append(monitoring.Actor("b", "Gemini two", "running", engine="agy"))
+        analysis = monitoring.Analysis(
+            "/tmp/session.jsonl", [first, second], monitoring.Usage(), 0, 2, provider="codex",
+        )
+        self.assertEqual([actor.key for _, actor in monitoring.session_processes(analysis, 1)], ["a"])
+        self.assertEqual([actor.key for _, actor in monitoring.session_processes(analysis, 2)], ["b"])
+
     def test_yielded_shell_commands_are_not_background_agents(self):
         records = [
             codex_records()[0], codex_records()[1], codex_records()[2], codex_records()[3],

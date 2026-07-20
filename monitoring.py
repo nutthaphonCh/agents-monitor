@@ -1796,8 +1796,15 @@ def actor_detail_lines(actor: Actor) -> list[str]:
 ACTIVE_PROCESS_STATES = {"starting", "running", "waiting"}
 
 
-def session_processes(analysis: Analysis) -> list[tuple[PromptTurn, Actor]]:
-    processes = [(prompt, actor) for prompt in analysis.prompts for actor in prompt.actors]
+def session_processes(
+    analysis: Analysis, prompt_index: int | None = None,
+) -> list[tuple[PromptTurn, Actor]]:
+    processes = [
+        (prompt, actor)
+        for prompt in analysis.prompts
+        if prompt_index is None or prompt.index == prompt_index
+        for actor in prompt.actors
+    ]
     return sorted(
         processes,
         key=lambda item: (
@@ -2069,7 +2076,7 @@ class TTYApp:
         return next((p for p in self.analysis.prompts if p.index == self.selected_prompt), None)
 
     def selected_process(self) -> tuple[PromptTurn, Actor] | None:
-        processes = session_processes(self.analysis)
+        processes = session_processes(self.analysis, self.selected_prompt)
         if not processes:
             return None
         self.process_cursor = max(0, min(self.process_cursor, len(processes) - 1))
@@ -2164,7 +2171,7 @@ class TTYApp:
             elif key in (27, curses.KEY_LEFT):
                 self.mode = "processes" if self.mode == "process_detail" else "list"
             elif self.mode == "processes":
-                count = len(session_processes(self.analysis))
+                count = len(session_processes(self.analysis, self.selected_prompt))
                 if key == curses.KEY_DOWN:
                     self.process_cursor = min(max(0, count - 1), self.process_cursor + 1)
                 elif key == curses.KEY_UP:
@@ -2195,6 +2202,10 @@ class TTYApp:
             self.select_provider("claude")
             return True
         if key == ord("p") and self.mode == "list":
+            items = self.current_items()
+            if items:
+                index = max(0, min(self.cursor[self.view], len(items) - 1))
+                self.selected_prompt = items[index][0]
             self.mode, self.process_cursor, self.process_offset = "processes", 0, 0
             return True
         if key == ord("x"):
@@ -2283,9 +2294,9 @@ class TTYApp:
         rows.append((truncate(session, width - 1), 0))
 
         if self.mode == "processes":
-            processes = session_processes(self.analysis)
+            processes = session_processes(self.analysis, self.selected_prompt)
             active = sum(actor.status in ACTIVE_PROCESS_STATES for _, actor in processes)
-            rows.append((f" Spawned background agents · {active} active · {len(processes) - active} finished", curses.A_BOLD))
+            rows.append((f" Prompt {self.selected_prompt} background agents · {active} active · {len(processes) - active} finished", curses.A_BOLD))
             rows.append(("", 0))
             rendered: list[tuple[int, str]] = []
             previous_group = ""
@@ -2308,7 +2319,7 @@ class TTYApp:
                     curses.A_REVERSE if index == self.process_cursor else (curses.A_BOLD if index < 0 else 0),
                 ))
             if not processes:
-                rows.append(("  No spawned background agents observed in this session.", 0))
+                rows.append((f"  No spawned background agents observed for prompt {self.selected_prompt}.", 0))
             footer = fit_action_bar(
                 " PROCESSES │ ↑/↓ select │ → detail │ p/← back │ q quit",
                 " PROCESSES │ ↑/↓ │ → detail │ p back",
