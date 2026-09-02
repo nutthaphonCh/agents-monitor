@@ -241,7 +241,7 @@ class SessionDiscoveryTests(unittest.TestCase):
 
             self.assertEqual(entries, [(200, str(current_shard))])
 
-    def test_brackets_navigate_newest_first_chats_chronologically(self):
+    def test_brackets_follow_displayed_chat_indices(self):
         app = object.__new__(monitoring.TTYApp)
         app.mode = "list"
         movements = []
@@ -250,7 +250,7 @@ class SessionDiscoveryTests(unittest.TestCase):
         app.handle_key(ord("["))
         app.handle_key(ord("]"))
 
-        self.assertEqual(movements, [1, -1])
+        self.assertEqual(movements, [-1, 1])
 
 
 class ProfilerModelTests(unittest.TestCase):

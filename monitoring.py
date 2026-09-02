@@ -2346,9 +2346,9 @@ class TTYApp:
             if self.search_query:
                 self.update_search()
         elif key == ord("["):
-            self.switch_session(1)
-        elif key == ord("]"):
             self.switch_session(-1)
+        elif key == ord("]"):
+            self.switch_session(1)
         elif key == curses.KEY_DOWN:
             if self.view == 1 and self.cursor[1] == self.prompt_anchor(len(self.analysis.prompts)):
                 self.follow_latest()
