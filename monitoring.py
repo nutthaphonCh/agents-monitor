@@ -42,6 +42,7 @@ import re
 import shlex
 import sqlite3
 import sys
+import textwrap
 import time
 
 from collections import Counter
@@ -51,7 +52,7 @@ from typing import Any
 
 
 REFRESH_INTERVAL = 0.5
-CACHE_SCHEMA_VERSION = 8
+CACHE_SCHEMA_VERSION = 9
 ESCAPE_DELAY_MS = 25
 ACTION_NAMES = (
     "WebSearch", "WebFetch", "Bash", "Write", "Edit", "Read", "Glob", "Grep", "Search",
@@ -169,6 +170,7 @@ class RequestInfo:
     request_id: str = ""
     stop_reason: str | None = None
     actions: list[str] = field(default_factory=list)
+    action_details: list[str] = field(default_factory=list)
     last_timestamp: str | None = None
 
 
@@ -721,6 +723,19 @@ def tool_activity_label(name: str, inputs: dict[str, Any]) -> str:
     return name
 
 
+def tool_action_detail(name: str, inputs: dict[str, Any]) -> str:
+    """Return the unabridged input that is most useful when inspecting an action."""
+    if name == "Bash":
+        return str(inputs.get("command") or "")
+    if name in {"Read", "Write", "Edit"}:
+        return str(inputs.get("file_path") or inputs.get("path") or "")
+    if name in {"Glob", "Grep"}:
+        return str(inputs.get("pattern") or inputs.get("query") or "")
+    if name in {"WebSearch", "WebFetch"}:
+        return str(inputs.get("query") or inputs.get("url") or "")
+    return json.dumps(inputs, ensure_ascii=False, indent=2) if inputs else ""
+
+
 def embedded_json(text: str) -> dict[str, Any] | None:
     cleaned = "\n".join(re.sub(r"^\s*\d+[→\t]", "", line) for line in text.splitlines())
     start, end = cleaned.find("{"), cleaned.rfind("}")
@@ -981,6 +996,7 @@ def enrich_record(
         prompt.timeline.append(TimelineItem(timestamp, f"{activity} — started", "tool"))
         if request_info and activity not in request_info.actions:
             request_info.actions.append(activity)
+            request_info.action_details.append(tool_action_detail(name, inputs))
 
         action = FILE_TOOL_ACTIONS.get(name)
         if action:
@@ -1230,6 +1246,17 @@ def codex_exec_command(payload: dict[str, Any]) -> str:
     return match.group(2).replace("\\n", "\n") if match else ""
 
 
+def codex_tool_detail(payload: dict[str, Any]) -> str:
+    """Keep complete tool input for the request detail page."""
+    command = codex_exec_command(payload)
+    if command:
+        return command
+    raw_input = payload.get("input")
+    if isinstance(raw_input, dict):
+        return json.dumps(raw_input, ensure_ascii=False, indent=2)
+    return str(raw_input or "")
+
+
 def codex_message_text(payload: dict[str, Any]) -> str:
     content = payload.get("content")
     if isinstance(content, str):
@@ -1264,6 +1291,7 @@ class CodexSessionAnalyzer:
         self.partial = ""
         self.model = "codex"
         self.pending_actions: list[str] = []
+        self.pending_action_details: list[str] = []
         self.pending_cells: dict[str, Actor] = {}
         self.base_evidence: Counter[str] = Counter()
         self.poll()
@@ -1342,6 +1370,7 @@ class CodexSessionAnalyzer:
             prompt.evidence_chars["conversation"] += local_token_weight(str(payload.get("message") or ""))
             self.analysis.prompts.append(prompt)
             self.pending_actions = []
+            self.pending_action_details = []
             return
         prompt = self.analysis.prompts[-1] if self.analysis.prompts else None
         if not prompt:
@@ -1352,6 +1381,7 @@ class CodexSessionAnalyzer:
             call_id = str(payload.get("call_id") or payload.get("id") or self.sequence)
             prompt.timeline.append(TimelineItem(timestamp, f"{activity} — started", "tool"))
             self.pending_actions.append(activity)
+            self.pending_action_details.append(codex_tool_detail(payload))
             command = codex_exec_command(payload) if action == "Bash" else ""
             self.tools[call_id] = (prompt, activity, {"command": command})
             engine = spawned_agent_engine(command)
@@ -1429,8 +1459,10 @@ class CodexSessionAnalyzer:
             prompt.requests.append(RequestInfo(
                 timestamp, self.model, usage, request_id=f"codex:{self.sequence}",
                 stop_reason="turn", actions=self.pending_actions,
+                action_details=self.pending_action_details,
             ))
             self.pending_actions = []
+            self.pending_action_details = []
             return
         if kind == "task_complete":
             prompt.timeline.append(TimelineItem(timestamp, "Prompt completed", "prompt"))
@@ -1564,6 +1596,13 @@ class ProfilerCache:
                     analysis.prompts[-1].main.primary_model if analysis.prompts else "codex"
                 ))
                 analyzer.pending_actions = list(state.get("pending_actions") or [])
+                analyzer.pending_action_details = list(state.get("pending_action_details") or [])
+                analyzer.pending_cells = {
+                    actor.task_id: actor
+                    for prompt in analysis.prompts
+                    for actor in prompt.actors
+                    if actor.status == "running" and actor.task_id
+                }
                 analyzer.base_evidence = Counter(state.get("base_evidence") or {})
             analyzer.tools = {}
             for tool_id, tool in state.get("tools", {}).items():
@@ -1588,6 +1627,7 @@ class ProfilerCache:
             "tools": tools,
             "model": getattr(analyzer, "model", None),
             "pending_actions": getattr(analyzer, "pending_actions", []),
+            "pending_action_details": getattr(analyzer, "pending_action_details", []),
             "base_evidence": dict(getattr(analyzer, "base_evidence", {})),
         }, ensure_ascii=False, separators=(",", ":"))
         try:
@@ -1764,6 +1804,48 @@ def section_line_indices(lines: list[str]) -> list[int]:
     ]
 
 
+def request_line_indices(lines: list[str]) -> list[int]:
+    return [index for index, line in enumerate(lines) if re.match(r"^\s*\d+\s+\|", line)]
+
+
+def wrapped_detail_lines(value: str, width: int, indent: str = "    ") -> list[str]:
+    # The detail renderer reserves one more column after adding its row prefix.
+    available = max(1, width - len(indent) - 1)
+    lines: list[str] = []
+    for physical_line in (value.splitlines() or [""]):
+        wrapped = textwrap.wrap(
+            physical_line, width=available, replace_whitespace=False,
+            drop_whitespace=False, break_long_words=True, break_on_hyphens=False,
+        ) or [""]
+        lines.extend(indent + part for part in wrapped)
+    return lines
+
+
+def request_detail_lines(request: RequestInfo, index: int, width: int) -> list[str]:
+    usage = request.usage
+    lines = [
+        f"Request {index + 1}", "",
+        f"Time         {timestamp_hm(request.timestamp)}",
+        f"Model        {request.model}",
+        f"Context      {fmt_tokens(usage.context_total)}",
+        f"Cached       {usage.cache_hit_rate:.0f}%",
+        f"Output       {fmt_tokens(usage.output)}",
+        f"Stop reason  {request.stop_reason or '-'}",
+        "", "Actions",
+    ]
+    if not request.actions:
+        return lines + ["  No actions observed"]
+    for action_index, action in enumerate(request.actions):
+        lines.extend(["", f"  {action_index + 1}. {action.split(' · ', 1)[0]}"])
+        detail = (
+            request.action_details[action_index]
+            if action_index < len(request.action_details) and request.action_details[action_index]
+            else action
+        )
+        lines.extend(wrapped_detail_lines(detail, width))
+    return lines
+
+
 def detail_page_lines(prompt: PromptTurn, page: str, width: int) -> list[str]:
     if page == "prompt":
         return prompt_overview_lines(prompt, width)
@@ -1785,6 +1867,13 @@ def detail_page_lines(prompt: PromptTurn, page: str, width: int) -> list[str]:
             f"{timestamp_hm(item.timestamp)}  {item.action:<6}  {item.path}" for item in prompt.files
         ]
         return lines if prompt.files else ["Files", "", "No file activity observed"]
+    if page.startswith("request:"):
+        try:
+            request_index = int(page.split(":", 1)[1])
+            request = prompt.requests[request_index]
+        except (ValueError, IndexError):
+            return ["Request not found"]
+        return request_detail_lines(request, request_index, width)
     if page == "requests":
         description = (
             "One row per observed Codex model round (token_count)."
@@ -2230,10 +2319,16 @@ class TTYApp:
             if actor_index >= 0:
                 self.detail_page = f"actor:{actor_index}"
                 self.detail_offset = 0
+        elif self.detail_page == "requests" and prompt.requests:
+            self.detail_cursor = min(self.detail_cursor, len(prompt.requests) - 1)
+            self.detail_page = f"request:{self.detail_cursor}"
+            self.detail_offset = 0
 
     def back_detail(self) -> None:
         if self.detail_page.startswith("actor:"):
             self.detail_page = "actors"
+        elif self.detail_page.startswith("request:"):
+            self.detail_page = "requests"
         elif self.detail_page != "prompt":
             self.detail_page = "prompt"
             self.detail_cursor = 0
@@ -2354,6 +2449,9 @@ class TTYApp:
             elif self.detail_page == "actors" and prompt:
                 actor_count = len(prompt.actors) + (1 if prompt.main.total else 0)
                 if key == curses.KEY_DOWN: self.detail_cursor = min(max(0, actor_count - 1), self.detail_cursor + 1)
+                elif key == curses.KEY_UP: self.detail_cursor = max(0, self.detail_cursor - 1)
+            elif self.detail_page == "requests" and prompt:
+                if key == curses.KEY_DOWN: self.detail_cursor = min(max(0, len(prompt.requests) - 1), self.detail_cursor + 1)
                 elif key == curses.KEY_UP: self.detail_cursor = max(0, self.detail_cursor - 1)
             else:
                 if key == curses.KEY_DOWN: self.detail_offset += 1
@@ -2507,6 +2605,7 @@ class TTYApp:
             else:
                 lines = detail_page_lines(prompt, self.detail_page, width - 2) if prompt else ["Prompt not found"]
             prompt_sections = section_line_indices(lines) if self.detail_page == "prompt" else []
+            request_lines = request_line_indices(lines) if self.detail_page == "requests" else []
             max_offset = max(0, len(lines) - body_height)
             self.detail_offset = min(self.detail_offset, max_offset)
             selected_line = None
@@ -2514,6 +2613,8 @@ class TTYApp:
                 selected_line = prompt_sections[min(self.detail_cursor, len(prompt_sections) - 1)]
             elif self.detail_page == "actors":
                 selected_line = self.detail_cursor + 2
+            elif self.detail_page == "requests" and request_lines:
+                selected_line = request_lines[min(self.detail_cursor, len(request_lines) - 1)]
             if selected_line is not None:
                 if selected_line < self.detail_offset:
                     self.detail_offset = selected_line
@@ -2525,10 +2626,13 @@ class TTYApp:
                     selectable = prompt_sections.index(line_index) == self.detail_cursor
                 elif self.detail_page == "actors" and line_index >= 2:
                     selectable = line_index - 2 == self.detail_cursor
+                elif self.detail_page == "requests" and line_index in request_lines:
+                    selectable = request_lines.index(line_index) == self.detail_cursor
                 attr = curses.A_REVERSE if selectable else (curses.A_BOLD if line_index == 0 else 0)
                 enterable = (
                     (self.detail_page == "prompt" and line_index in prompt_sections)
                     or (self.detail_page == "actors" and line_index >= 2)
+                    or (self.detail_page == "requests" and line_index in request_lines)
                 )
                 prefix = "> " if enterable else "  "
                 rows.append((prefix + truncate_layout(line, width - len(prefix) - 1), attr))

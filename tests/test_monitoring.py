@@ -480,6 +480,7 @@ class ProfilerModelTests(unittest.TestCase):
             self.assertEqual(turn.main.output, 5)
             self.assertEqual(turn.main.requests, 1)
             self.assertEqual(turn.requests[0].actions, ["Bash · pytest"])
+            self.assertEqual(turn.requests[0].action_details, ["pytest"])
             self.assertEqual(monitoring.main_actor_name(turn), "Codex")
             timeline = [item.label for item in turn.timeline]
             self.assertIn("Bash · pytest — started", timeline)
@@ -962,6 +963,29 @@ class FrameAffordanceTests(unittest.TestCase):
             app.detail_page = "requests"
             rendered_action = next(row for row, _ in app.frame() if "→ Bash" in row)
             self.assertTrue(rendered_action.startswith("      → "))
+        finally:
+            fixture.close()
+
+    def test_enter_on_request_opens_full_command_detail(self):
+        fixture = SessionFixture([prompt(), request_with_actor()])
+        try:
+            class Screen:
+                def getmaxyx(self):
+                    return 24, 64
+
+            app = monitoring.TTYApp(Screen(), fixture.path)
+            app.refresh(force=True)
+            app.inspect()
+            app.detail_page = "requests"
+            app.handle_key(10)
+            self.assertEqual(app.detail_page, "request:0")
+            detail = "\n".join(row for row, _ in app.frame())
+            self.assertIn(
+                "TELEMETRY=logs/codex-last.telemetry.json codex exec --json",
+                " ".join(detail.split()),
+            )
+            app.handle_key(monitoring.curses.KEY_LEFT)
+            self.assertEqual(app.detail_page, "requests")
         finally:
             fixture.close()
 
