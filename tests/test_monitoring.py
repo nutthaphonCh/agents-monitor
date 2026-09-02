@@ -3,6 +3,7 @@ import fcntl
 import os
 import pty
 import select
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -11,6 +12,7 @@ import time
 import unittest
 import struct
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -158,6 +160,97 @@ class SessionFixture:
 
     def close(self):
         os.unlink(self.path)
+
+
+class SessionDiscoveryTests(unittest.TestCase):
+    @staticmethod
+    def write_codex_rollout(path, chat_id, source="user"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "type": "session_meta",
+            "payload": {"id": chat_id, "session_id": chat_id, "thread_source": source},
+        }) + "\n", encoding="utf-8")
+
+    @staticmethod
+    def create_codex_state(path):
+        connection = sqlite3.connect(path)
+        connection.execute("""
+            CREATE TABLE threads (
+                id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL,
+                recency_at_ms INTEGER, recency_at INTEGER,
+                updated_at_ms INTEGER, updated_at INTEGER,
+                created_at_ms INTEGER, created_at INTEGER,
+                archived INTEGER, thread_source TEXT, has_user_event INTEGER
+            )
+        """)
+        return connection
+
+    def test_codex_chats_follow_recency_and_current_rollout_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sessions = root / "sessions"
+            old_shard = sessions / "rollout-chat-old.jsonl"
+            current_shard = sessions / "rollout-chat-current.jsonl"
+            newer_chat = sessions / "rollout-newer-chat.jsonl"
+            subagent = sessions / "rollout-subagent.jsonl"
+            self.write_codex_rollout(old_shard, "chat-one")
+            self.write_codex_rollout(current_shard, "chat-one")
+            self.write_codex_rollout(newer_chat, "chat-two")
+            self.write_codex_rollout(subagent, "worker", "subagent")
+            state = root / "state.sqlite"
+            connection = self.create_codex_state(state)
+            connection.executemany(
+                "INSERT INTO threads VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0, ?, ?)",
+                [
+                    ("chat-one", str(current_shard), 100_000, "user", 1),
+                    ("chat-two", str(newer_chat), 200_000, "user", 1),
+                    ("worker", str(subagent), 300_000, "subagent", 0),
+                ],
+            )
+            connection.commit()
+            connection.close()
+
+            with (
+                mock.patch.object(monitoring, "default_projects_dir", return_value=root / "claude"),
+                mock.patch.object(monitoring, "default_codex_sessions_dir", return_value=sessions),
+                mock.patch.object(monitoring, "default_codex_state_db", return_value=state),
+            ):
+                entries = monitoring.find_all_session_entries()
+
+            self.assertEqual(entries, [(200.0, str(newer_chat)), (100.0, str(current_shard))])
+
+    def test_codex_fallback_groups_shards_and_excludes_subagents(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sessions = root / "sessions"
+            old_shard = sessions / "rollout-chat-old.jsonl"
+            current_shard = sessions / "rollout-chat-current.jsonl"
+            subagent = sessions / "rollout-subagent.jsonl"
+            self.write_codex_rollout(old_shard, "chat-one")
+            self.write_codex_rollout(current_shard, "chat-one")
+            self.write_codex_rollout(subagent, "worker", "subagent")
+            os.utime(old_shard, (100, 100))
+            os.utime(current_shard, (200, 200))
+            os.utime(subagent, (300, 300))
+
+            with (
+                mock.patch.object(monitoring, "default_codex_sessions_dir", return_value=sessions),
+                mock.patch.object(monitoring, "default_codex_state_db", return_value=root / "missing.sqlite"),
+            ):
+                entries = monitoring.codex_chats()
+
+            self.assertEqual(entries, [(200, str(current_shard))])
+
+    def test_brackets_navigate_newest_first_chats_chronologically(self):
+        app = object.__new__(monitoring.TTYApp)
+        app.mode = "list"
+        movements = []
+        app.switch_session = movements.append
+
+        app.handle_key(ord("["))
+        app.handle_key(ord("]"))
+
+        self.assertEqual(movements, [1, -1])
 
 
 class ProfilerModelTests(unittest.TestCase):

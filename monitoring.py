@@ -245,12 +245,105 @@ def default_codex_sessions_dir() -> Path:
     return Path(os.path.expanduser("~/.codex/sessions"))
 
 
+def default_codex_state_db() -> Path:
+    return Path(os.path.expanduser("~/.codex/state_5.sqlite"))
+
+
+def codex_session_metadata(path: str) -> tuple[str, str] | None:
+    """Return (chat id, thread source) from a rollout's session metadata."""
+    try:
+        with Path(path).open(encoding="utf-8") as session_file:
+            record = json.loads(session_file.readline())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if record.get("type") != "session_meta":
+        return None
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    chat_id = payload.get("session_id") or payload.get("id")
+    if not isinstance(chat_id, str) or not chat_id:
+        return None
+    source = payload.get("thread_source")
+    return chat_id, source if isinstance(source, str) else ""
+
+
+def fallback_codex_chats() -> list[tuple[float, str]]:
+    """Discover one latest user-facing rollout per chat without the state DB."""
+    root = default_codex_sessions_dir()
+    if not root.exists():
+        return []
+    chats: dict[str, tuple[float, str]] = {}
+    for path in glob.glob(str(root / "**" / "*.jsonl"), recursive=True):
+        metadata = codex_session_metadata(path)
+        if metadata is None:
+            chat_id, source = path, ""
+        else:
+            chat_id, source = metadata
+        if source == "subagent":
+            continue
+        modified = os.path.getmtime(path)
+        current = chats.get(chat_id)
+        if current is None or modified > current[0]:
+            chats[chat_id] = (modified, path)
+    return list(chats.values())
+
+
+def codex_chats() -> list[tuple[float, str]]:
+    """Read Codex's chat ordering and current rollout path from local state."""
+    state_db = default_codex_state_db()
+    try:
+        connection = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True)
+        try:
+            rows = connection.execute(
+                """
+                SELECT rollout_path, recency_at_ms, recency_at,
+                       updated_at_ms, updated_at, created_at_ms, created_at
+                FROM threads
+                WHERE archived = 0
+                  AND (thread_source = 'user' OR has_user_event = 1)
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error):
+        return fallback_codex_chats()
+
+    chats: list[tuple[float, str]] = []
+    seen: set[str] = set()
+    for path, recency_ms, recency, updated_ms, updated, created_ms, created in rows:
+        if not isinstance(path, str) or path in seen or not Path(path).is_file():
+            continue
+        seen.add(path)
+        timestamp = next(
+            (
+                value / 1000 if is_milliseconds else value
+                for value, is_milliseconds in (
+                    (recency_ms, True), (recency, False),
+                    (updated_ms, True), (updated, False),
+                    (created_ms, True), (created, False),
+                )
+                if isinstance(value, (int, float)) and value > 0
+            ),
+            os.path.getmtime(path),
+        )
+        chats.append((timestamp, path))
+    return chats or fallback_codex_chats()
+
+
+def find_all_session_entries() -> list[tuple[float, str]]:
+    sessions: list[tuple[float, str]] = []
+    claude_root = default_projects_dir()
+    if claude_root.exists():
+        for path in glob.glob(str(claude_root / "**" / "*.jsonl"), recursive=True):
+            if "subagents" not in Path(path).parts:
+                sessions.append((os.path.getmtime(path), path))
+    sessions.extend(codex_chats())
+    return sorted(sessions, key=lambda item: (item[0], item[1]), reverse=True)
+
+
 def find_all_sessions() -> list[str]:
-    files: list[str] = []
-    for root in (default_projects_dir(), default_codex_sessions_dir()):
-        if root.exists():
-            files.extend(glob.glob(str(root / "**" / "*.jsonl"), recursive=True))
-    return sorted(files, key=os.path.getmtime, reverse=True)
+    return [path for _, path in find_all_session_entries()]
 
 
 def session_provider(path: str) -> str:
@@ -2253,9 +2346,9 @@ class TTYApp:
             if self.search_query:
                 self.update_search()
         elif key == ord("["):
-            self.switch_session(-1)
-        elif key == ord("]"):
             self.switch_session(1)
+        elif key == ord("]"):
+            self.switch_session(-1)
         elif key == curses.KEY_DOWN:
             if self.view == 1 and self.cursor[1] == self.prompt_anchor(len(self.analysis.prompts)):
                 self.follow_latest()
@@ -2295,7 +2388,7 @@ class TTYApp:
         header = truncate_layout(header_left + " " * gap + source_tabs, width - 1)
         rows: list[tuple[str, int]] = [(header, curses.A_BOLD)]
         provider = self.analysis.provider.title()
-        session = f"Session {self.session_index + 1}/{len(self.session_paths)} · {provider} · {Path(self.path).stem} · {self.status}"
+        session = f"Chat {self.session_index + 1}/{len(self.session_paths)} · {provider} · {Path(self.path).stem} · {self.status}"
         rows.append((truncate(session, width - 1), 0))
 
         if self.mode == "processes":
@@ -2541,8 +2634,8 @@ class TTYApp:
 
 
 def print_session_list(limit: int) -> None:
-    for path in find_all_sessions()[:limit]:
-        modified = dt.datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M")
+    for ordering_time, path in find_all_session_entries()[:limit]:
+        modified = dt.datetime.fromtimestamp(ordering_time).strftime("%Y-%m-%d %H:%M")
         print(
             f"{modified}  {session_provider(path):<6}  "
             f"{os.path.getsize(path) / 1024 / 1024:7.1f} MiB  {path}"
