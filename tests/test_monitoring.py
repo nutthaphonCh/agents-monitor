@@ -481,6 +481,7 @@ class ProfilerModelTests(unittest.TestCase):
             self.assertEqual(turn.main.requests, 1)
             self.assertEqual(turn.requests[0].actions, ["Bash · pytest"])
             self.assertEqual(turn.requests[0].action_details, ["pytest"])
+            self.assertEqual(turn.requests[0].action_outputs, ["ok"])
             self.assertEqual(monitoring.main_actor_name(turn), "Codex")
             timeline = [item.label for item in turn.timeline]
             self.assertIn("Bash · pytest — started", timeline)
@@ -721,6 +722,7 @@ class TTYIntegrationTests(unittest.TestCase):
             self.assertIsInstance(first, monitoring.CodexSessionAnalyzer)
             self.assertIsInstance(second, monitoring.CodexSessionAnalyzer)
             self.assertEqual(second.analysis.prompts[0].main.context_total, 100)
+            self.assertEqual(second.analysis.prompts[0].requests[0].action_outputs, ["ok"])
             cache.db.close()
         finally:
             if not session.closed:
@@ -967,7 +969,7 @@ class FrameAffordanceTests(unittest.TestCase):
             fixture.close()
 
     def test_enter_on_request_opens_full_command_detail(self):
-        fixture = SessionFixture([prompt(), request_with_actor()])
+        fixture = SessionFixture([prompt(), request_with_actor(), actor_started()])
         try:
             class Screen:
                 def getmaxyx(self):
@@ -980,12 +982,38 @@ class FrameAffordanceTests(unittest.TestCase):
             app.handle_key(10)
             self.assertEqual(app.detail_page, "request:0")
             detail = "\n".join(row for row, _ in app.frame())
+            self.assertIn("10:00 · fable · ↓ 100 (70% cached) · ↑ 5", detail)
             self.assertIn(
-                "TELEMETRY=logs/codex-last.telemetry.json codex exec --json",
+                "$ TELEMETRY=logs/codex-last.telemetry.json codex exec --json",
                 " ".join(detail.split()),
             )
+            self.assertIn("Output", detail)
+            self.assertIn("Command running in background with ID: task123.", detail)
             app.handle_key(monitoring.curses.KEY_LEFT)
             self.assertEqual(app.detail_page, "requests")
+        finally:
+            fixture.close()
+
+    @mock.patch("monitoring.subprocess.run")
+    def test_y_copies_full_request_commands(self, run):
+        fixture = SessionFixture([prompt(), request_with_actor()])
+        try:
+            class Screen:
+                def getmaxyx(self):
+                    return 24, 80
+
+            app = monitoring.TTYApp(Screen(), fixture.path)
+            app.refresh(force=True)
+            app.inspect()
+            app.detail_page = "request:0"
+            app.handle_key(ord("y"))
+            run.assert_called_once_with(
+                ("pbcopy",),
+                input="TELEMETRY=logs/codex-last.telemetry.json codex exec --json",
+                text=True,
+                check=True,
+            )
+            self.assertEqual(app.clipboard_notice, "copied")
         finally:
             fixture.close()
 

@@ -41,6 +41,7 @@ import os
 import re
 import shlex
 import sqlite3
+import subprocess
 import sys
 import textwrap
 import time
@@ -52,7 +53,7 @@ from typing import Any
 
 
 REFRESH_INTERVAL = 0.5
-CACHE_SCHEMA_VERSION = 9
+CACHE_SCHEMA_VERSION = 10
 ESCAPE_DELAY_MS = 25
 ACTION_NAMES = (
     "WebSearch", "WebFetch", "Bash", "Write", "Edit", "Read", "Glob", "Grep", "Search",
@@ -171,6 +172,7 @@ class RequestInfo:
     stop_reason: str | None = None
     actions: list[str] = field(default_factory=list)
     action_details: list[str] = field(default_factory=list)
+    action_outputs: list[str] = field(default_factory=list)
     last_timestamp: str | None = None
 
 
@@ -736,6 +738,49 @@ def tool_action_detail(name: str, inputs: dict[str, Any]) -> str:
     return json.dumps(inputs, ensure_ascii=False, indent=2) if inputs else ""
 
 
+def compact_action_output(value: str, max_lines: int = 24, max_chars: int = 12_000) -> str:
+    """Bound stored tool output while retaining useful evidence from both ends."""
+    value = re.sub(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))", "", value)
+    if len(value) > max_chars:
+        tail_chars = max_chars // 4
+        value = (
+            value[:max_chars - tail_chars]
+            + "\n… output truncated …\n"
+            + value[-tail_chars:]
+        )
+    lines = value.splitlines()
+    if len(lines) <= max_lines:
+        return value
+    head_count = max_lines - 6
+    omitted = len(lines) - max_lines
+    return "\n".join(lines[:head_count] + [f"… {omitted} lines omitted …"] + lines[-6:])
+
+
+def attach_action_output(prompt: PromptTurn, inputs: dict[str, Any], output: str) -> None:
+    request_index = inputs.get("__request_index")
+    action_index = inputs.get("__action_index")
+    if not isinstance(request_index, int) or not isinstance(action_index, int):
+        return
+    if not 0 <= request_index < len(prompt.requests):
+        return
+    request = prompt.requests[request_index]
+    while len(request.action_outputs) < len(request.actions):
+        request.action_outputs.append("")
+    if action_index < len(request.action_outputs):
+        request.action_outputs[action_index] = compact_action_output(output)
+
+
+def tool_result_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "\n".join(
+            str(item.get("text") or item.get("content") or "")
+            for item in value if isinstance(item, dict)
+        )
+    return json.dumps(value, ensure_ascii=False) if value is not None else ""
+
+
 def embedded_json(text: str) -> dict[str, Any] | None:
     cleaned = "\n".join(re.sub(r"^\s*\d+[→\t]", "", line) for line in text.splitlines())
     start, end = cleaned.find("{"), cleaned.rfind("}")
@@ -991,12 +1036,22 @@ def enrich_record(
         tool_id = str(block.get("id") or "")
         name = str(block.get("name") or "Tool")
         inputs = block.get("input") if isinstance(block.get("input"), dict) else {}
-        tools_by_id[tool_id] = (prompt, name, inputs)
         activity = tool_activity_label(name, inputs)
         prompt.timeline.append(TimelineItem(timestamp, f"{activity} — started", "tool"))
-        if request_info and activity not in request_info.actions:
-            request_info.actions.append(activity)
-            request_info.action_details.append(tool_action_detail(name, inputs))
+        tool_inputs = dict(inputs)
+        if request_info:
+            existing = tools_by_id.get(tool_id)
+            existing_inputs = existing[2] if existing and existing[0] is prompt else {}
+            if isinstance(existing_inputs.get("__action_index"), int):
+                action_index = existing_inputs["__action_index"]
+            else:
+                action_index = len(request_info.actions)
+                request_info.actions.append(activity)
+                request_info.action_details.append(tool_action_detail(name, inputs))
+                request_info.action_outputs.append("")
+            tool_inputs["__request_index"] = prompt.requests.index(request_info)
+            tool_inputs["__action_index"] = action_index
+        tools_by_id[tool_id] = (prompt, name, tool_inputs)
 
         action = FILE_TOOL_ACTIONS.get(name)
         if action:
@@ -1028,13 +1083,14 @@ def enrich_record(
     for block in content_blocks(content, "tool_result"):
         tool_id = str(block.get("tool_use_id") or "")
         linked = tools_by_id.get(tool_id)
-        result_text = str(block.get("content") or "")
+        result_text = tool_result_text(block.get("content"))
         if linked:
             owner, name, inputs = linked
             activity = tool_activity_label(name, inputs)
             background_running = name == "Bash" and "running in background with ID" in result_text
             state = "failed" if block.get("is_error") else ("running" if background_running else "completed")
             owner.timeline.append(TimelineItem(timestamp, f"{activity} — {state}", "tool"))
+            attach_action_output(owner, inputs, result_text)
             target_path = str(inputs.get("file_path") or inputs.get("path") or "")
             if target_path.endswith(AGENT_INSTRUCTION_FILES):
                 owner.evidence_chars["agents"] += local_token_weight(result_text)
@@ -1292,6 +1348,7 @@ class CodexSessionAnalyzer:
         self.model = "codex"
         self.pending_actions: list[str] = []
         self.pending_action_details: list[str] = []
+        self.pending_action_outputs: list[str] = []
         self.pending_cells: dict[str, Actor] = {}
         self.base_evidence: Counter[str] = Counter()
         self.poll()
@@ -1371,6 +1428,7 @@ class CodexSessionAnalyzer:
             self.analysis.prompts.append(prompt)
             self.pending_actions = []
             self.pending_action_details = []
+            self.pending_action_outputs = []
             return
         prompt = self.analysis.prompts[-1] if self.analysis.prompts else None
         if not prompt:
@@ -1382,8 +1440,12 @@ class CodexSessionAnalyzer:
             prompt.timeline.append(TimelineItem(timestamp, f"{activity} — started", "tool"))
             self.pending_actions.append(activity)
             self.pending_action_details.append(codex_tool_detail(payload))
+            self.pending_action_outputs.append("")
             command = codex_exec_command(payload) if action == "Bash" else ""
-            self.tools[call_id] = (prompt, activity, {"command": command})
+            self.tools[call_id] = (
+                prompt, activity,
+                {"command": command, "__action_index": len(self.pending_actions) - 1},
+            )
             engine = spawned_agent_engine(command)
             if engine:
                 display_name = {"agy": "Gemini", "claude": "Claude", "codex": "Codex"}[engine]
@@ -1403,9 +1465,13 @@ class CodexSessionAnalyzer:
             call_id = str(payload.get("call_id") or "")
             linked = self.tools.get(call_id)
             if linked:
-                owner, activity, _ = linked
+                owner, activity, inputs = linked
                 owner.timeline.append(TimelineItem(timestamp, f"{activity} — completed", "tool"))
-                result_text = str(payload.get("output") or "")
+                result_text = codex_function_output_text(payload)
+                action_index = inputs.get("__action_index")
+                if isinstance(action_index, int) and action_index < len(self.pending_action_outputs):
+                    self.pending_action_outputs[action_index] = compact_action_output(result_text)
+                attach_action_output(owner, inputs, result_text)
                 category = "repository" if activity.startswith(("Read ·", "Glob ·", "Grep ·")) else "tool output"
                 owner.evidence_chars[category] += local_token_weight(result_text)
                 actor = actor_for_tool(owner, call_id)
@@ -1456,13 +1522,19 @@ class CodexSessionAnalyzer:
             usage = Usage()
             usage.add(self.model, max(0, total_input - cached), output, 0, cached)
             prompt.main.merge(usage)
+            request_index = len(prompt.requests)
             prompt.requests.append(RequestInfo(
                 timestamp, self.model, usage, request_id=f"codex:{self.sequence}",
                 stop_reason="turn", actions=self.pending_actions,
                 action_details=self.pending_action_details,
+                action_outputs=self.pending_action_outputs,
             ))
+            for owner, _, inputs in self.tools.values():
+                if owner is prompt and "__action_index" in inputs and "__request_index" not in inputs:
+                    inputs["__request_index"] = request_index
             self.pending_actions = []
             self.pending_action_details = []
+            self.pending_action_outputs = []
             return
         if kind == "task_complete":
             prompt.timeline.append(TimelineItem(timestamp, "Prompt completed", "prompt"))
@@ -1597,6 +1669,7 @@ class ProfilerCache:
                 ))
                 analyzer.pending_actions = list(state.get("pending_actions") or [])
                 analyzer.pending_action_details = list(state.get("pending_action_details") or [])
+                analyzer.pending_action_outputs = list(state.get("pending_action_outputs") or [])
                 analyzer.pending_cells = {
                     actor.task_id: actor
                     for prompt in analysis.prompts
@@ -1628,6 +1701,7 @@ class ProfilerCache:
             "model": getattr(analyzer, "model", None),
             "pending_actions": getattr(analyzer, "pending_actions", []),
             "pending_action_details": getattr(analyzer, "pending_action_details", []),
+            "pending_action_outputs": getattr(analyzer, "pending_action_outputs", []),
             "base_evidence": dict(getattr(analyzer, "base_evidence", {})),
         }, ensure_ascii=False, separators=(",", ":"))
         try:
@@ -1808,41 +1882,85 @@ def request_line_indices(lines: list[str]) -> list[int]:
     return [index for index, line in enumerate(lines) if re.match(r"^\s*\d+\s+\|", line)]
 
 
-def wrapped_detail_lines(value: str, width: int, indent: str = "    ") -> list[str]:
-    # The detail renderer reserves one more column after adding its row prefix.
-    available = max(1, width - len(indent) - 1)
+def wrapped_prefixed_lines(
+    value: str, width: int, first_prefix: str, continuation_prefix: str,
+) -> list[str]:
+    available = max(1, width - len(first_prefix) - 1)
     lines: list[str] = []
+    first = True
     for physical_line in (value.splitlines() or [""]):
         wrapped = textwrap.wrap(
             physical_line, width=available, replace_whitespace=False,
             drop_whitespace=False, break_long_words=True, break_on_hyphens=False,
         ) or [""]
-        lines.extend(indent + part for part in wrapped)
+        for part in wrapped:
+            prefix = first_prefix if first else continuation_prefix
+            lines.append(prefix + part)
+            first = False
     return lines
+
+
+def output_box_lines(value: str, width: int) -> list[str]:
+    indent = "    "
+    rule_width = max(8, min(56, width - len(indent) - 1))
+    lines = [indent + "┌" + "─" * (rule_width - 1)]
+    content = value or "No output captured"
+    lines.extend(wrapped_prefixed_lines(content, width, indent + "│ ", indent + "│ "))
+    lines.append(indent + "└" + "─" * (rule_width - 1))
+    return lines
+
+
+def request_commands(request: RequestInfo) -> str:
+    commands = [
+        request.action_details[index]
+        for index, action in enumerate(request.actions)
+        if action.startswith("Bash")
+        and index < len(request.action_details)
+        and request.action_details[index]
+    ]
+    return "\n".join(commands)
+
+
+def copy_to_clipboard(value: str) -> bool:
+    if not value:
+        return False
+    try:
+        subprocess.run(("pbcopy",), input=value, text=True, check=True)
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return True
 
 
 def request_detail_lines(request: RequestInfo, index: int, width: int) -> list[str]:
     usage = request.usage
     lines = [
-        f"Request {index + 1}", "",
-        f"Time         {timestamp_hm(request.timestamp)}",
-        f"Model        {request.model}",
-        f"Context      {fmt_tokens(usage.context_total)}",
-        f"Cached       {usage.cache_hit_rate:.0f}%",
-        f"Output       {fmt_tokens(usage.output)}",
-        f"Stop reason  {request.stop_reason or '-'}",
+        f"Request {index + 1}",
+        (
+            f"{timestamp_hm(request.timestamp)} · {short_model(request.model, 24)} · "
+            f"↓ {fmt_tokens(usage.context_total)} ({usage.cache_hit_rate:.0f}% cached) · "
+            f"↑ {fmt_tokens(usage.output)} · {request.stop_reason or '-'}"
+        ),
         "", "Actions",
     ]
     if not request.actions:
         return lines + ["  No actions observed"]
     for action_index, action in enumerate(request.actions):
-        lines.extend(["", f"  {action_index + 1}. {action.split(' · ', 1)[0]}"])
+        lines.extend(["", f"{action_index + 1}. {action.split(' · ', 1)[0]}"])
         detail = (
             request.action_details[action_index]
             if action_index < len(request.action_details) and request.action_details[action_index]
             else action
         )
-        lines.extend(wrapped_detail_lines(detail, width))
+        action_name = action.split(" · ", 1)[0]
+        first_prefix = "   $ " if action_name == "Bash" else "     "
+        lines.extend(wrapped_prefixed_lines(detail, width, first_prefix, "     "))
+        output = (
+            request.action_outputs[action_index]
+            if action_index < len(request.action_outputs)
+            else ""
+        )
+        lines.extend(["", "   Output"])
+        lines.extend(output_box_lines(output, width))
     return lines
 
 
@@ -2122,6 +2240,7 @@ class TTYApp:
         self.detail_offset = 0
         self.detail_page = "prompt"
         self.detail_cursor = 0
+        self.clipboard_notice = ""
         self.process_cursor = 0
         self.process_offset = 0
         self.process_tab = "response"
@@ -2323,6 +2442,7 @@ class TTYApp:
             self.detail_cursor = min(self.detail_cursor, len(prompt.requests) - 1)
             self.detail_page = f"request:{self.detail_cursor}"
             self.detail_offset = 0
+            self.clipboard_notice = ""
 
     def back_detail(self) -> None:
         if self.detail_page.startswith("actor:"):
@@ -2443,6 +2563,14 @@ class TTYApp:
             return True
         if self.mode == "detail":
             prompt = self.selected_prompt_turn()
+            if key == ord("y") and prompt and self.detail_page.startswith("request:"):
+                try:
+                    request_index = int(self.detail_page.split(":", 1)[1])
+                    command_text = request_commands(prompt.requests[request_index])
+                except (ValueError, IndexError):
+                    command_text = ""
+                self.clipboard_notice = "copied" if copy_to_clipboard(command_text) else "nothing to copy"
+                return True
             if self.detail_page == "prompt":
                 if key == curses.KEY_DOWN: self.detail_cursor = min(5, self.detail_cursor + 1)
                 elif key == curses.KEY_UP: self.detail_cursor = max(0, self.detail_cursor - 1)
@@ -2636,11 +2764,19 @@ class TTYApp:
                 )
                 prefix = "> " if enterable else "  "
                 rows.append((prefix + truncate_layout(line, width - len(prefix) - 1), attr))
-            footer = fit_action_bar(
-                " INSPECT │ ↑/↓ select/scroll │ → open │ ← back │ q quit",
-                " INSPECT │ ↑/↓ │ → open │ ← back │ q",
-                width,
-            )
+            if self.detail_page.startswith("request:"):
+                notice = f" │ {self.clipboard_notice}" if self.clipboard_notice else ""
+                footer = fit_action_bar(
+                    f" REQUEST DETAIL │ ↑/↓ scroll │ y copy command{notice} │ ← back │ q quit",
+                    f" DETAIL │ ↑/↓ │ y copy{notice} │ ← back",
+                    width,
+                )
+            else:
+                footer = fit_action_bar(
+                    " INSPECT │ ↑/↓ select/scroll │ → open │ ← back │ q quit",
+                    " INSPECT │ ↑/↓ │ → open │ ← back │ q",
+                    width,
+                )
         elif self.mode == "help":
             lines = [
                 "Help",
