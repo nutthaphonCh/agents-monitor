@@ -106,7 +106,10 @@ def codex_records():
             "type": "task_started", "turn_id": "turn-1",
         }},
         {"type": "event_msg", "timestamp": "2026-07-20T10:00:01Z", "payload": {
-            "type": "user_message", "message": "Fix the profiler",
+            "type": "item_completed", "turn_id": "turn-1", "item": {
+                "type": "UserMessage", "id": "user-item-1",
+                "content": [{"type": "text", "text": "Fix the profiler"}],
+            },
         }},
         {"type": "response_item", "timestamp": "2026-07-20T10:00:02Z", "payload": {
             "type": "custom_tool_call", "call_id": "call-1", "name": "exec",
@@ -419,6 +422,18 @@ class ProfilerModelTests(unittest.TestCase):
             self.assertEqual(summary["duration_seconds"], 3.0)
         finally:
             events.close()
+
+    def test_codex_legacy_user_message_event_is_still_supported(self):
+        records = codex_records()[:3] + [{
+            "type": "event_msg", "timestamp": "2026-07-20T10:00:01Z",
+            "payload": {"type": "user_message", "message": "Legacy prompt"},
+        }]
+        fixture = SessionFixture(records)
+        try:
+            analysis = monitoring.CodexSessionAnalyzer(fixture.path).analysis
+            self.assertEqual([turn.prompt for turn in analysis.prompts], ["Legacy prompt"])
+        finally:
+            fixture.close()
 
     def test_codex_rollout_normalizes_into_shared_profiler_model(self):
         handle = tempfile.NamedTemporaryFile(

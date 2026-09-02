@@ -51,7 +51,7 @@ from typing import Any
 
 
 REFRESH_INTERVAL = 0.5
-CACHE_SCHEMA_VERSION = 7
+CACHE_SCHEMA_VERSION = 8
 ESCAPE_DELAY_MS = 25
 ACTION_NAMES = (
     "WebSearch", "WebFetch", "Bash", "Write", "Edit", "Read", "Glob", "Grep", "Search",
@@ -1316,6 +1316,12 @@ class CodexSessionAnalyzer:
         if rec.get("type") == "turn_context":
             self.model = str(payload.get("model") or self.model)
             return
+        if kind == "item_completed":
+            item = payload.get("item")
+            if not isinstance(item, dict) or str(item.get("type") or "").lower() != "usermessage":
+                return
+            payload = {"type": "user_message", "message": codex_message_text(item)}
+            kind = "user_message"
         if kind == "message" and str(payload.get("role") or "") == "developer":
             text = codex_message_text(payload)
             category = "agents" if "AGENTS.md" in text or "<INSTRUCTIONS>" in text else "system"
