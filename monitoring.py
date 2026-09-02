@@ -2051,7 +2051,24 @@ class TTYApp:
         self.previous_frame: list[tuple[str, int]] = []
         self.status = "ready"
 
+    def refresh_session_catalog(self) -> None:
+        current_provider = session_provider(self.path)
+        previous_paths = self.session_paths
+        all_paths = find_all_sessions()
+        candidates = [
+            path for path in all_paths if session_provider(path) == current_provider
+        ]
+        if self.path not in candidates:
+            candidates.insert(min(self.session_index, len(candidates)), self.path)
+            all_paths.append(self.path)
+        self.all_session_paths = all_paths
+        self.session_paths = candidates
+        self.session_index = candidates.index(self.path)
+        if candidates != previous_paths:
+            self.previous_frame = []
+
     def switch_session(self, delta: int) -> None:
+        self.refresh_session_catalog()
         index = max(0, min(len(self.session_paths) - 1, self.session_index + delta))
         if index == self.session_index:
             return
@@ -2067,6 +2084,16 @@ class TTYApp:
         self.refresh(force=True)
         if self.search_query:
             self.update_search()
+
+    def session_navigation_availability(self) -> tuple[bool, bool]:
+        return self.session_index > 0, self.session_index < len(self.session_paths) - 1
+
+    def session_header(self, width: int) -> str:
+        provider = self.analysis.provider.title()
+        prefix = f"< · {provider} · "
+        suffix = f" · {self.status} · >"
+        stem_width = max(1, width - len(prefix) - len(suffix))
+        return truncate_layout(prefix + truncate(Path(self.path).stem, stem_width) + suffix, width)
 
     def select_provider(self, target_provider: str) -> None:
         current_provider = session_provider(self.path)
@@ -2393,9 +2420,7 @@ class TTYApp:
         gap = max(2, width - 1 - len(header_left) - len(source_tabs))
         header = truncate_layout(header_left + " " * gap + source_tabs, width - 1)
         rows: list[tuple[str, int]] = [(header, curses.A_BOLD)]
-        provider = self.analysis.provider.title()
-        session = f"Chat {self.session_index + 1}/{len(self.session_paths)} · {provider} · {Path(self.path).stem} · {self.status}"
-        rows.append((truncate(session, width - 1), 0))
+        rows.append((self.session_header(width - 1), 0))
 
         if self.mode == "processes":
             processes = session_processes(self.analysis, self.selected_prompt)
@@ -2592,6 +2617,15 @@ class TTYApp:
                 self.screen.move(row, 0)
                 self.screen.clrtoeol()
                 self.screen.addnstr(row, 0, current[0], max(1, width - 1), current[1])
+                if row == 1:
+                    previous_available, next_available = self.session_navigation_availability()
+                    if not previous_available:
+                        self.screen.addnstr(row, 0, "<", 1, current[1] | curses.A_DIM)
+                    next_position = current[0].rfind(">")
+                    if not next_available and next_position >= 0:
+                        self.screen.addnstr(
+                            row, next_position, ">", 1, current[1] | curses.A_DIM,
+                        )
                 tool_span = action_span(current[0])
                 if tool_span:
                     start, end = tool_span

@@ -255,6 +255,34 @@ class SessionDiscoveryTests(unittest.TestCase):
 
         self.assertEqual(movements, [-1, 1])
 
+    def test_bracket_refresh_discovers_a_newer_chat_before_moving(self):
+        newer = SessionFixture([prompt("Newer")])
+        current = SessionFixture([prompt("Current")])
+        older = SessionFixture([prompt("Older")])
+
+        class Screen:
+            def getmaxyx(self):
+                return 24, 120
+
+        try:
+            app = monitoring.TTYApp(Screen(), current.path)
+            app.all_session_paths = [current.path, older.path]
+            app.session_paths = [current.path, older.path]
+            app.session_index = 0
+            with mock.patch.object(
+                monitoring, "find_all_sessions",
+                return_value=[newer.path, current.path, older.path],
+            ):
+                app.handle_key(ord("["))
+
+            self.assertEqual(app.path, newer.path)
+            self.assertEqual(app.session_index, 0)
+            self.assertEqual(app.session_paths, [newer.path, current.path, older.path])
+        finally:
+            newer.close()
+            current.close()
+            older.close()
+
 
 class ProfilerModelTests(unittest.TestCase):
     def setUp(self):
@@ -701,6 +729,25 @@ class TTYIntegrationTests(unittest.TestCase):
 
 
 class FrameAffordanceTests(unittest.TestCase):
+    def test_chat_header_uses_navigation_arrows_instead_of_position_counts(self):
+        app = object.__new__(monitoring.TTYApp)
+        app.analysis = monitoring.Analysis(
+            "/tmp/rollout-current.jsonl", [], monitoring.Usage(), 0, 0, provider="codex",
+        )
+        app.path = app.analysis.path
+        app.status = "20:06:31"
+        app.session_paths = [app.path, "/tmp/rollout-older.jsonl"]
+        app.session_index = 0
+
+        header = app.session_header(120)
+
+        self.assertTrue(header.startswith("< · Codex · rollout-current"))
+        self.assertTrue(header.endswith("· 20:06:31 · >"))
+        self.assertNotIn("Chat 1/", header)
+        self.assertEqual(app.session_navigation_availability(), (False, True))
+        app.session_index = 1
+        self.assertEqual(app.session_navigation_availability(), (True, False))
+
     def test_process_clock_renders_local_started_and_finished_times(self):
         timestamp = "2026-07-20T10:11:12+00:00"
         expected = monitoring.parse_iso_timestamp(timestamp).astimezone().strftime("%H:%M:%S")
