@@ -3,15 +3,18 @@
 monitoring.py — live execution profiler for Claude Code and Codex sessions.
 
 Views
-  [1] Live  prompt-centric execution tree, auto-refreshed
+  [1] Live     prompt-centric execution tree, auto-refreshed
   [2] History  newest prompts first
+  [o] Overall  shallow usage summary across sessions active in the last 90 days
 
 Keys
   1 / 2       switch view
   [           previous session
   ]           next session
   z / x       Claude / Codex sessions
-  p           background processes for the current session
+  o / O       Overall consumption page
+  p           background processes for the current session; on the Overall
+              page, p/P instead exports a self-contained shareable HTML report
   Up / Down   move between prompts
   Right/Enter open; Left/Esc back
   PgUp/PgDn   scroll one page
@@ -36,6 +39,7 @@ import argparse
 import curses
 import datetime as dt
 import glob
+import html
 import json
 import os
 import re
@@ -44,16 +48,18 @@ import sqlite3
 import subprocess
 import sys
 import textwrap
+import threading
 import time
+import unicodedata
 
 from collections import Counter
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 REFRESH_INTERVAL = 0.5
-CACHE_SCHEMA_VERSION = 10
+CACHE_SCHEMA_VERSION = 12
 ESCAPE_DELAY_MS = 25
 ACTION_NAMES = (
     "WebSearch", "WebFetch", "Bash", "Write", "Edit", "Read", "Glob", "Grep", "Search",
@@ -71,6 +77,23 @@ ACTION_PALETTES = {
 }
 
 
+def configured_weight(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, default))
+        return value if value >= 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+@dataclass(frozen=True)
+class ConsumptionConfig:
+    fresh_weight: float = configured_weight("AGENT_MONITOR_FRESH_WEIGHT", 1.0)
+    cache_weight: float = configured_weight("AGENT_MONITOR_CACHE_WEIGHT", 0.1)
+
+
+CONSUMPTION_CONFIG = ConsumptionConfig()
+
+
 @dataclass
 class Usage:
     input: int = 0
@@ -79,6 +102,10 @@ class Usage:
     cache_read: int = 0
     requests: int = 0
     models: Counter[str] = field(default_factory=Counter)
+    # Raw telemetry retained for context diagnostics and weighted consumption scoring.
+    model_totals: Counter[str] = field(default_factory=Counter)
+    model_fresh: Counter[str] = field(default_factory=Counter)
+    model_cache: Counter[str] = field(default_factory=Counter)
 
     def add(self, model: str, inp: int, out: int, cache_create: int, cache_read: int) -> None:
         self.input += inp
@@ -87,6 +114,9 @@ class Usage:
         self.cache_read += cache_read
         self.requests += 1
         self.models[model] += 1
+        self.model_totals[model] += inp + out + cache_create + cache_read
+        self.model_fresh[model] += inp + out + cache_create
+        self.model_cache[model] += cache_read
 
     def merge(self, other: "Usage") -> None:
         self.input += other.input
@@ -95,6 +125,9 @@ class Usage:
         self.cache_read += other.cache_read
         self.requests += other.requests
         self.models.update(other.models)
+        self.model_totals.update(other.model_totals)
+        self.model_fresh.update(other.model_fresh)
+        self.model_cache.update(other.model_cache)
 
     @property
     def total(self) -> int:
@@ -107,6 +140,33 @@ class Usage:
     @property
     def cache_hit_rate(self) -> float:
         return (self.cache_read / self.context_total * 100) if self.context_total else 0.0
+
+    @property
+    def fresh(self) -> int:
+        return self.input + self.output + self.cache_create
+
+    @property
+    def consumption(self) -> float:
+        return self.fresh_consumption + self.cache_consumption
+
+    @property
+    def fresh_consumption(self) -> float:
+        return self.fresh * CONSUMPTION_CONFIG.fresh_weight
+
+    @property
+    def cache_consumption(self) -> float:
+        return self.cache_read * CONSUMPTION_CONFIG.cache_weight
+
+    @property
+    def model_consumption(self) -> Counter[str]:
+        models = self.model_fresh.keys() | self.model_cache.keys()
+        return Counter({
+            model: (
+                self.model_fresh[model] * CONSUMPTION_CONFIG.fresh_weight
+                + self.model_cache[model] * CONSUMPTION_CONFIG.cache_weight
+            )
+            for model in models
+        })
 
     @property
     def primary_model(self) -> str:
@@ -241,6 +301,66 @@ class Analysis:
         return total
 
 
+# The Overall page covers sessions whose files were last written within this window.
+# Older sessions are skipped before parsing (cheap: file mtime only) and their count is
+# always shown in the scope line, so the window is visible rather than silently applied.
+OVERALL_WINDOW_DAYS = 90
+
+
+@dataclass
+class SessionUsage:
+    session_id: str
+    rollout_id: str
+    rollout_count: int
+    label: str
+    timestamp: str | None
+    provider: str
+    usage: Usage = field(default_factory=Usage)
+    prompt_count: int = 0
+    latest_context: int = 0
+    peak_context: int = 0
+    cache_hit_rate: float = 0.0
+    path: str = ""
+
+
+@dataclass
+class ProjectUsage:
+    name: str
+    usage: Usage = field(default_factory=Usage)
+    sessions: int = 0
+    prompts: int = 0
+    recent_sessions: list[SessionUsage] = field(default_factory=list)
+    files: Counter[str] = field(default_factory=Counter)
+    # Full working directory — the grouping key. `name` is only a display label.
+    root: str = ""
+
+
+@dataclass
+class DayUsage:
+    day: str
+    usage: Usage = field(default_factory=Usage)
+
+
+@dataclass
+class OverallReport:
+    """Aggregated, measured usage across every session discovered on disk."""
+    total: Usage
+    projects: list[ProjectUsage]
+    provider_usage: dict[str, Usage]
+    provider_sessions: Counter[str]
+    session_count: int
+    discovered_count: int
+    prompt_count: int
+    unreadable: int
+    days: list[DayUsage]
+    window_days: int = OVERALL_WINDOW_DAYS
+
+    @property
+    def excluded_old(self) -> int:
+        """Discovered sessions skipped because their file was last written before the window."""
+        return max(0, self.discovered_count - self.session_count - self.unreadable)
+
+
 def default_projects_dir() -> Path:
     return Path(os.path.expanduser("~/.claude/projects"))
 
@@ -335,13 +455,45 @@ def codex_chats() -> list[tuple[float, str]]:
     return chats or fallback_codex_chats()
 
 
+ACTIVITY_TAIL_BYTES = 65536
+
+
+def claude_session_activity(path: str) -> float:
+    """Epoch seconds of the last timestamped record, falling back to the file mtime.
+
+    Claude Code appends timestamp-less bookkeeping records (``last-prompt``, ``mode``,
+    ``atis-latch``…) to old transcripts when they are merely listed or resumed, so a file's
+    mtime routinely jumps weeks ahead of its real conversation activity.
+    """
+    mtime = os.path.getmtime(path)
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - ACTIVITY_TAIL_BYTES))
+            tail = fh.read().decode("utf-8", "ignore")
+    except OSError:
+        return mtime
+    for line in reversed(tail.splitlines()):
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        stamp = parse_iso_timestamp(record.get("timestamp")) if isinstance(record, dict) else None
+        if stamp:
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=dt.timezone.utc)
+            return stamp.timestamp()
+    return mtime
+
+
 def find_all_session_entries() -> list[tuple[float, str]]:
+    """Discovered sessions as (last activity epoch, path), newest first."""
     sessions: list[tuple[float, str]] = []
     claude_root = default_projects_dir()
     if claude_root.exists():
         for path in glob.glob(str(claude_root / "**" / "*.jsonl"), recursive=True):
             if "subagents" not in Path(path).parts:
-                sessions.append((os.path.getmtime(path), path))
+                sessions.append((claude_session_activity(path), path))
     sessions.extend(codex_chats())
     return sorted(sessions, key=lambda item: (item[0], item[1]), reverse=True)
 
@@ -401,6 +553,46 @@ def truncate_layout(value: str, limit: int) -> str:
     return value[: max(0, limit - 1)] + "…"
 
 
+def terminal_char_width(char: str) -> int:
+    if unicodedata.category(char) in {"Mn", "Me"} or unicodedata.combining(char):
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+
+
+def terminal_width(value: str) -> int:
+    """Approximate curses cell width, including combining marks used by Thai text."""
+    return sum(terminal_char_width(char) for char in value)
+
+
+def truncate_terminal(value: str, limit: int) -> str:
+    """Truncate normalized text to a terminal-cell budget."""
+    return truncate_terminal_layout(normalize_text(value), limit)
+
+
+def truncate_terminal_layout(value: str, limit: int) -> str:
+    """Truncate to terminal cells without collapsing intentional layout spaces."""
+    if terminal_width(value) <= limit:
+        return value
+    budget = max(0, limit - 1)
+    result: list[str] = []
+    used = 0
+    for char in value:
+        width = terminal_char_width(char)
+        if used + width > budget:
+            break
+        result.append(char)
+        used += width
+    return "".join(result) + "…"
+
+
+def space_between(left: str, right: str, width: int, minimum_gap: int = 2) -> str:
+    """Keep the trailing value flush-right while safely truncating the left side."""
+    right_width = terminal_width(right)
+    left = truncate_terminal(left, max(1, width - right_width - minimum_gap))
+    gap = max(minimum_gap, width - terminal_width(left) - right_width)
+    return left + " " * gap + right
+
+
 def short_model(model: str, limit: int = 18) -> str:
     value = (model or "unknown").split("/")[-1]
     if value.startswith("claude-"):
@@ -414,6 +606,15 @@ def fmt_tokens(value: int) -> str:
     if value >= 1_000:
         return f"{value / 1_000:.1f}K"
     return str(value)
+
+
+def fmt_consumption(value: float) -> str:
+    """Format the configured weighted consumption score without implying a token unit."""
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.2f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}K"
+    return f"{value:.1f}" if value % 1 else str(int(value))
 
 
 def message_content(rec: dict[str, Any]) -> Any:
@@ -1735,6 +1936,261 @@ class ProfilerCache:
         return analyzer
 
 
+def session_cwd(path: str) -> str | None:
+    """First working directory recorded in a session file, if any."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for _, line in zip(range(50), fh):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                payload = rec.get("payload")
+                candidates = [rec.get("cwd")]
+                if isinstance(payload, dict):
+                    candidates.append(payload.get("cwd"))
+                for candidate in candidates:
+                    if isinstance(candidate, str) and candidate:
+                        return candidate
+    except OSError:
+        pass
+    return None
+
+
+# Claude Code hands each session a scratchpad under /private/tmp/claude-<uid>/<encoded project
+# dir>/<session id>/scratchpad. Sessions launched from there (e.g. a Codex run spawned by Claude)
+# belong to the owning session's project, not to a project called "scratchpad".
+SCRATCHPAD_CWD = re.compile(
+    r"^/private/tmp/claude-\d+/(?P<project_dir>[^/]+)/(?P<session_id>[0-9a-fA-F-]{36})/scratchpad(?:/|$)"
+)
+
+
+def resolve_scratchpad_cwd(cwd: str) -> str:
+    """Map a scratchpad working directory back to the project of the session that owns it."""
+    match = SCRATCHPAD_CWD.match(cwd)
+    if not match:
+        return cwd
+    owner = default_projects_dir() / match.group("project_dir") / f"{match.group('session_id')}.jsonl"
+    if owner.is_file():
+        resolved = session_cwd(str(owner))
+        if resolved and not SCRATCHPAD_CWD.match(resolved):
+            return resolved
+    return cwd
+
+
+def session_project_root(path: str) -> str:
+    """Full working directory used to group a session into a project."""
+    cwd = session_cwd(path)
+    if cwd:
+        return resolve_scratchpad_cwd(cwd)
+    return str(Path(path).parent)
+
+
+def project_display_names(roots: list[str]) -> dict[str, str]:
+    """Basename per root; roots that share a basename get enough parent segments to tell apart."""
+    labels = {root: Path(root).name or root for root in roots}
+    depth = 1
+    while True:
+        counts = Counter(labels.values())
+        clashing = [root for root, label in labels.items() if counts[label] > 1]
+        if not clashing:
+            return labels
+        depth += 1
+        widened = False
+        for root in clashing:
+            segments = [part for part in Path(root).parts if part != Path(root).anchor]
+            if depth <= len(segments):
+                labels[root] = "/".join(segments[-depth:])
+                widened = True
+        if not widened:
+            return labels
+
+
+def session_identifier(path: str) -> str:
+    """Return the logical provider session/thread ID."""
+    if session_provider(path) == "codex":
+        metadata = codex_session_metadata(path)
+        if metadata and metadata[0]:
+            return metadata[0]
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for _, line in zip(range(50), fh):
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                value = record.get("sessionId") or record.get("session_id")
+                if isinstance(value, str) and value:
+                    return value
+    except OSError:
+        pass
+    return Path(path).stem
+
+
+def display_rollout_id(value: str) -> str:
+    """Shorten UUIDs inside a rollout name for display; never use this as an identity."""
+    return re.sub(
+        r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4})"
+        r"-[0-9a-fA-F]{12}(?=_|$)",
+        r"\1",
+        value,
+    )
+
+
+def codex_rollout_shards(path: str) -> list[str]:
+    """Find rollout shards that belong to the same logical Codex thread."""
+    metadata = codex_session_metadata(path)
+    if not metadata or not metadata[0]:
+        return [path]
+    thread_id = metadata[0]
+    candidates = {
+        str(candidate)
+        for candidate in Path(path).parent.glob(f"*{thread_id}*.jsonl")
+        if codex_session_metadata(str(candidate)) == metadata
+    }
+    candidates.add(path)
+    return sorted(candidates, key=lambda item: (os.path.getmtime(item), item))
+
+
+def session_context_summary(analyses: list[Analysis]) -> tuple[int, int, float]:
+    """Return latest/peak context and cache percentage across the whole session."""
+    requests = [
+        request.usage
+        for analysis in analyses
+        for prompt in analysis.prompts
+        for request in prompt.requests
+        if request.usage.context_total
+    ]
+    if not requests:
+        return 0, 0, 0.0
+    latest = requests[-1]
+    aggregate = Usage()
+    for request in requests:
+        aggregate.merge(request)
+    return latest.context_total, max(item.context_total for item in requests), aggregate.cache_hit_rate
+
+
+def build_overall_report(
+    cache: "ProfilerCache | None", window_days: int = OVERALL_WINDOW_DAYS,
+    progress: Callable[[int, int], None] | None = None,
+    now: dt.datetime | None = None, tz: dt.tzinfo | None = None,
+) -> OverallReport:
+    """Aggregate measured usage across sessions active in the last ``window_days``, by project.
+
+    Reuses the same per-session Usage totals the Live/History views already trust
+    (via the shared profiler cache when available), so the Overall page never derives
+    its own, potentially divergent, consumption accounting.
+    """
+    entries = find_all_session_entries()
+    discovered_count = len(entries)
+
+    total = Usage()
+    projects: dict[str, ProjectUsage] = {}
+    provider_usage: dict[str, Usage] = {"claude": Usage(), "codex": Usage()}
+    provider_sessions: Counter[str] = Counter()
+    days: dict[str, Usage] = {}
+    prompt_count = 0
+    session_count = 0
+    unreadable = 0
+
+    report_now = now or dt.datetime.now(dt.timezone.utc)
+    if report_now.tzinfo is None:
+        report_now = report_now.replace(tzinfo=dt.timezone.utc)
+    # Provider timestamps are UTC; days and displayed dates follow the viewer's local clock.
+    local_tz = tz or dt.datetime.now().astimezone().tzinfo
+    recent_cutoff = report_now - dt.timedelta(days=30)
+    window_cutoff = report_now - dt.timedelta(days=window_days)
+    scoped = [
+        (ordering_time, path) for ordering_time, path in entries
+        if dt.datetime.fromtimestamp(ordering_time, tz=dt.timezone.utc) >= window_cutoff
+    ]
+    if progress:
+        progress(0, len(scoped))
+
+    for index, (ordering_time, path) in enumerate(scoped, 1):
+        provider = session_provider(path)
+        shard_paths = codex_rollout_shards(path) if provider == "codex" else [path]
+        analyses: list[Analysis] = []
+        try:
+            for shard_path in shard_paths:
+                analyses.append(
+                    (cache.analyzer(shard_path) if cache else create_analyzer(shard_path)).analysis
+                )
+        except (OSError, sqlite3.Error):
+            unreadable += 1
+            if progress:
+                progress(index, len(scoped))
+            continue
+
+        usage = Usage()
+        for analysis in analyses:
+            usage.merge(analysis.total_usage)
+        all_prompts = [prompt for analysis in analyses for prompt in analysis.prompts]
+        session_count += 1
+        prompt_count += len(all_prompts)
+        total.merge(usage)
+        provider_usage.setdefault(provider, Usage()).merge(usage)
+        provider_sessions[provider] += 1
+
+        project_root = session_project_root(path)
+        project = projects.setdefault(project_root, ProjectUsage(Path(project_root).name or project_root, root=project_root))
+        project.usage.merge(usage)
+        project.sessions += 1
+        project.prompts += len(all_prompts)
+
+        parsed_timestamps = [parse_iso_timestamp(prompt.timestamp) for prompt in all_prompts]
+        parsed_timestamps = [
+            value.replace(tzinfo=dt.timezone.utc) if value and value.tzinfo is None else value
+            for value in parsed_timestamps if value
+        ]
+        session_time = max(parsed_timestamps) if parsed_timestamps else dt.datetime.fromtimestamp(
+            ordering_time, tz=dt.timezone.utc,
+        )
+        if usage.total and session_time >= recent_cutoff:
+            label = all_prompts[0].prompt if all_prompts else Path(path).stem
+            latest_context, peak_context, cache_hit_rate = session_context_summary(analyses)
+            project.recent_sessions.append(SessionUsage(
+                session_identifier(path), Path(path).stem if provider == "codex" else "",
+                len(shard_paths), label, session_time.astimezone(local_tz).isoformat(), provider, usage,
+                len(all_prompts), latest_context, peak_context, cache_hit_rate, path,
+            ))
+
+        for prompt_turn in all_prompts:
+            prompt_usage = prompt_turn.total_usage
+            project.files.update(item.path for item in prompt_turn.files if item.path)
+            stamp = parse_iso_timestamp(prompt_turn.timestamp)
+            if stamp:
+                if stamp.tzinfo is None:
+                    stamp = stamp.replace(tzinfo=dt.timezone.utc)
+                day = stamp.astimezone(local_tz).date().isoformat()
+                days.setdefault(day, Usage()).merge(prompt_usage)
+        if progress:
+            progress(index, len(scoped))
+
+    for root, name in project_display_names(list(projects)).items():
+        projects[root].name = name
+
+    return OverallReport(
+        total=total,
+        projects=sorted(projects.values(), key=lambda item: item.usage.consumption, reverse=True),
+        provider_usage=provider_usage,
+        provider_sessions=provider_sessions,
+        session_count=session_count,
+        discovered_count=discovered_count,
+        prompt_count=prompt_count,
+        unreadable=unreadable,
+        days=[DayUsage(day, usage) for day, usage in sorted(days.items())],
+        window_days=window_days,
+    )
+
+
 def timestamp_hm(value: str | None) -> str:
     if value and "T" in value:
         return value.split("T", 1)[1][:5]
@@ -1780,6 +2236,195 @@ def history_feed(analysis: Analysis) -> list[tuple[int, str]]:
             f"{usage.requests} thinking rounds"
         )))
     return items
+
+
+def pct(part: float, whole: float) -> float:
+    return (part / whole * 100) if whole else 0.0
+
+
+OVERALL_SECTIONS = (
+    "Scope", "Consumption", "Provider / source split", "Top projects",
+    "Model split", "Consumption basis", "Time trend",
+)
+OVERALL_MAX_MODELS_SHOWN = 8
+OVERALL_TREND_DAYS = 14
+
+
+def overall_lines(report: OverallReport, width: int) -> list[str]:
+    """Shallow, scannable summary for the Overall page — one screen, no drill-down."""
+    total = report.total
+    lines: list[str] = []
+
+    lines.append("Scope")
+    lines.append(f"  Sessions active in the last {report.window_days} days")
+    scope = f"  {report.session_count} of {report.discovered_count} discovered sessions analyzed"
+    if report.unreadable:
+        scope += f" · {report.unreadable} unreadable, excluded"
+    if report.excluded_old:
+        scope += f" · {report.excluded_old} older than {report.window_days} days, excluded"
+    lines.append(scope)
+    lines.append("")
+
+    lines.append("Consumption")
+    if total.consumption:
+        lines.append(
+            f"  {fmt_consumption(total.consumption)} score  ·  "
+            f"{fmt_consumption(total.fresh_consumption)} fresh contribution  ·  "
+            f"{fmt_consumption(total.cache_consumption)} cache contribution"
+        )
+        lines.append(
+            f"  {report.session_count} sessions  ·  {report.prompt_count} prompts  ·  "
+            f"{total.requests} model requests"
+        )
+    else:
+        lines.append("  Not measured — no consumption found in scope")
+    lines.append("")
+
+    lines.append("Provider / source split")
+    provider_lines = [
+        f"  {provider.title():<7} {pct(usage.consumption, total.consumption):>5.1f}%  "
+        f"{fmt_consumption(usage.consumption):>8}  ·  {report.provider_sessions.get(provider, 0)} sessions"
+        for provider, usage in report.provider_usage.items()
+        if usage.consumption or report.provider_sessions.get(provider, 0)
+    ]
+    lines.extend(provider_lines or ["  Not measured"])
+    lines.append("")
+
+    lines.append("Top projects")
+    if report.projects:
+        for index, project in enumerate(report.projects, 1):
+            lines.append(
+                f"  {index:>2}. {truncate(project.name, 26):<26}  "
+                f"{pct(project.usage.consumption, total.consumption):>5.1f}%  "
+                f"{fmt_consumption(project.usage.consumption):>8}  ·  {project.sessions} sessions"
+            )
+    else:
+        lines.append("  No projects discovered")
+    lines.append("")
+
+    lines.append("Model split")
+    model_consumption = total.model_consumption
+    if model_consumption:
+        ranked = model_consumption.most_common(OVERALL_MAX_MODELS_SHOWN)
+        for model, score in ranked:
+            lines.append(
+                f"  {short_model(model, 22):<22} "
+                f"{pct(score, total.consumption):>5.1f}%  {fmt_consumption(score):>8}"
+            )
+        if len(model_consumption) > OVERALL_MAX_MODELS_SHOWN:
+            other = total.consumption - sum(score for _, score in ranked)
+            lines.append(
+                f"  {'Other models':<22} {pct(other, total.consumption):>5.1f}%  "
+                f"{fmt_consumption(other):>8}"
+            )
+    else:
+        lines.append("  Not measured")
+    lines.append("")
+
+    lines.append("Consumption basis")
+    if total.consumption:
+        lines.append(
+            f"  Fresh   {pct(total.fresh_consumption, total.consumption):>5.1f}%  "
+            f"{fmt_consumption(total.fresh_consumption):>8}  ×{CONSUMPTION_CONFIG.fresh_weight:g}"
+        )
+        lines.append(
+            f"  Cache   {pct(total.cache_consumption, total.consumption):>5.1f}%  "
+            f"{fmt_consumption(total.cache_consumption):>8}  ×{CONSUMPTION_CONFIG.cache_weight:g}"
+            f"  ({total.cache_hit_rate:.0f}% cached across all context)"
+        )
+    else:
+        lines.append("  Not measured")
+    lines.append("")
+
+    lines.append("Time trend")
+    recent_days = report.days[-OVERALL_TREND_DAYS:]
+    if recent_days:
+        peak = max((day.usage.consumption for day in recent_days), default=0)
+        bar_width = max(4, min(24, width - 30))
+        for day in recent_days:
+            score = day.usage.consumption
+            filled = max(1, round(score / peak * bar_width)) if peak and score else 0
+            lines.append(f"  {day.day}  {'█' * filled:<{bar_width}}  {fmt_consumption(score):>8}")
+    else:
+        lines.append("  Not measured — no timestamps found in scope")
+
+    return lines
+
+
+def overall_project_line_indices(lines: list[str]) -> list[int]:
+    return [index for index, line in enumerate(lines) if re.match(r"^\s+\d+\.\s", line)]
+
+
+PROJECT_DETAIL_SECTIONS = ("Model mix", "Top 5 sessions by consumption · last 30 days", "Top 5 files")
+PROJECT_DETAIL_CONTENT_WIDTH = 120
+
+
+def project_detail_lines(project: ProjectUsage, width: int) -> list[str]:
+    """Measured model/task usage plus observed file activity for one project."""
+    content_width = max(24, min(width, PROJECT_DETAIL_CONTENT_WIDTH))
+    lines = [
+        project.name,
+        (
+            f"{fmt_consumption(project.usage.consumption)} consumption · {project.sessions} sessions · "
+            f"{project.prompts} prompts · {project.usage.requests} model requests"
+        ),
+        "",
+        "Model mix",
+    ]
+    model_consumption = project.usage.model_consumption
+    if model_consumption:
+        for model, score in model_consumption.most_common():
+            lines.append(
+                f"  {short_model(model, 24):<24} "
+                f"{pct(score, project.usage.consumption):>5.1f}%  {fmt_consumption(score):>9}"
+            )
+    else:
+        lines.append("  Not measured")
+
+    lines.extend(["", "Top 5 sessions by consumption · last 30 days"])
+    sessions = sorted(
+        project.recent_sessions, key=lambda item: item.usage.consumption, reverse=True,
+    )[:5]
+    if sessions:
+        for index, session in enumerate(sessions, 1):
+            day = (session.timestamp or "unknown date")[:10]
+            model = short_model(session.usage.primary_model, 14)
+            lines.append(space_between(
+                f"  {index}. {session.label}", fmt_consumption(session.usage.consumption), content_width,
+            ))
+            context = (
+                f"ctx {fmt_tokens(session.latest_context)} latest / {fmt_tokens(session.peak_context)} peak · "
+                f"{session.cache_hit_rate:.0f}% cached overall"
+                if session.latest_context else "ctx not measured"
+            )
+            if session.provider == "codex" and session.rollout_id:
+                identity = truncate(display_rollout_id(session.rollout_id), 64)
+                if session.rollout_count > 1:
+                    identity += f" ({session.rollout_count} shards)"
+            else:
+                identity = f"session {truncate(session.session_id, 22)}"
+            lines.append(
+                f"     {identity} · {model} · {day} · "
+                f"{session.prompt_count} prompts · {context}"
+            )
+    else:
+        lines.append("  No measured sessions in the last 30 days")
+
+    lines.extend(["", "Top 5 files", "  Ranked by observed file operations, not consumption attribution."])
+    if project.files:
+        for index, (path, operations) in enumerate(project.files.most_common(5), 1):
+            lines.append(f"  {index}. {truncate(path, max(12, width - 22))} · {operations} operations")
+    else:
+        lines.append("  No structured file activity observed")
+    return lines
+
+
+def project_session_line_indices(lines: list[str]) -> list[int]:
+    """Return the metadata rows that act as session links in project detail."""
+    return [
+        index for index, line in enumerate(lines)
+        if line.startswith("     session ") or line.startswith("     rollout-")
+    ]
 
 
 DETAIL_SECTIONS = ("Actors", "Timeline", "Files", "Requests", "Context attribution", "Usage observation")
@@ -1929,6 +2574,341 @@ def copy_to_clipboard(value: str) -> bool:
     except (OSError, subprocess.CalledProcessError):
         return False
     return True
+
+
+def default_overall_report_path() -> Path:
+    return Path.home() / "Library" / "Caches" / "execution-profiler" / "overall-report.html"
+
+
+# Fixed categorical order — colors are assigned by rank/entity, never reused ad hoc,
+# so a re-export with the same data always paints the same series the same color.
+OVERALL_CATEGORICAL_COLORS = (
+    "#2a78d6", "#eb6834", "#1baf7a", "#eda100",
+    "#e87ba4", "#008300", "#4a3aa7", "#e34948",
+)
+OVERALL_HTML_MAX_MODELS = 30
+OVERALL_HTML_MAX_TREND_DAYS = 90
+
+
+def render_overall_html(report: OverallReport, generated_at: str) -> str:
+    """Render a single, offline, self-contained HTML usage report — inline CSS, no JS or external assets."""
+    esc = html.escape
+    total = report.total
+
+    def bar_row(label: str, value: float, whole: float, color: str, sub: str = "") -> str:
+        return (
+            '<div class="bar-row">'
+            f'<div class="bar-label" title="{esc(label)}">{esc(label)}</div>'
+            '<div class="bar-track">'
+            f'<div class="bar-fill" style="width:{pct(value, whole):.2f}%;background:{color}"></div>'
+            "</div>"
+            f'<div class="bar-value">{pct(value, whole):.1f}% · {esc(fmt_consumption(value))}{esc(sub)}</div>'
+            "</div>"
+        )
+
+    scope_note = (
+        f"last {report.window_days} days · "
+        f"{report.session_count} of {report.discovered_count} discovered sessions analyzed"
+    )
+    if report.unreadable:
+        scope_note += f" · {report.unreadable} unreadable, excluded"
+    if report.excluded_old:
+        scope_note += f" · {report.excluded_old} older than {report.window_days} days, excluded"
+
+    kpi_tiles = "".join(
+        f'<div class="tile"><div class="tile-value">{esc(value)}</div><div class="tile-label">{esc(label)}</div></div>'
+        for label, value in (
+            ("Consumption score", fmt_consumption(total.consumption) if total.consumption else "—"),
+            ("Sessions", str(report.session_count)),
+            ("Prompts", str(report.prompt_count)),
+            ("Model requests", str(total.requests)),
+        )
+    )
+
+    provider_colors = {"claude": "var(--series-1)", "codex": "var(--series-2)"}
+    provider_rows = "".join(
+        bar_row(
+            provider.title(), usage.consumption, total.consumption,
+            provider_colors.get(provider, "var(--muted)"),
+            sub=f" · {report.provider_sessions.get(provider, 0)} sessions",
+        )
+        for provider, usage in report.provider_usage.items()
+        if usage.consumption or report.provider_sessions.get(provider, 0)
+    ) or '<p class="muted">Not measured.</p>'
+
+    project_details = []
+    for project in report.projects:
+        project_models = project.usage.model_consumption
+        model_mix = "".join(
+            bar_row(
+                short_model(model, 40), score, project.usage.consumption,
+                OVERALL_CATEGORICAL_COLORS[index % len(OVERALL_CATEGORICAL_COLORS)],
+            )
+            for index, (model, score) in enumerate(project_models.most_common())
+        ) or '<p class="muted">Not measured.</p>'
+        sessions = sorted(
+            project.recent_sessions, key=lambda item: item.usage.consumption, reverse=True,
+        )[:5]
+        session_items = "".join(
+            '<div class="session-row">'
+            '<div class="session-main">'
+            f'<span class="session-rank">{index}.</span>'
+            f'<span class="session-title">{esc(session.label)}</span>'
+            f'<strong class="session-score">{esc(fmt_consumption(session.usage.consumption))}</strong>'
+            '</div>'
+            '<div class="session-meta">'
+            + (
+                f'<code title="thread {esc(session.session_id)} · full rollout {esc(session.rollout_id)}">'
+                f'{esc(display_rollout_id(session.rollout_id))}</code>'
+                f'<span>{session.rollout_count} shard(s)</span>'
+                if session.provider == "codex" and session.rollout_id
+                else f'<code title="{esc(session.session_id)}">session {esc(session.session_id)}</code>'
+            )
+            +
+            f'<span>{esc(short_model(session.usage.primary_model, 32))}</span>'
+            f'<span>{esc((session.timestamp or "unknown date")[:10])}</span>'
+            f'<span>{session.prompt_count} prompts</span>'
+            f'<span>ctx {esc(fmt_tokens(session.latest_context))} latest / '
+            f'{esc(fmt_tokens(session.peak_context))} peak · {session.cache_hit_rate:.0f}% cached overall</span>'
+            '</div></div>'
+            for index, session in enumerate(sessions, 1)
+        ) or '<p class="muted">No measured sessions in the last 30 days.</p>'
+        file_rows = "".join(
+            f"<tr><td>{index}</td><td><code>{esc(path)}</code></td><td>{operations}</td></tr>"
+            for index, (path, operations) in enumerate(project.files.most_common(5), 1)
+        ) or '<tr><td colspan="3" class="muted">No structured file activity observed.</td></tr>'
+        project_details.append(f"""
+        <details class="project-detail">
+          <summary>
+            <span class="project-name" title="{esc(project.root)}">{esc(project.name)}</span>
+            <span class="bar-track"><span class="bar-fill" style="width:{pct(project.usage.consumption, total.consumption):.2f}%;background:var(--series-seq)"></span></span>
+            <span class="summary-value">{pct(project.usage.consumption, total.consumption):.1f}% · {esc(fmt_consumption(project.usage.consumption))} · {project.sessions} session(s)</span>
+          </summary>
+          <div class="detail-body">
+            <h3>Model mix within project</h3>{model_mix}
+            <h3>Top 5 sessions by consumption · last 30 days</h3>
+            <div class="session-list">{session_items}</div>
+            <h3>Top 5 files by observed activity</h3>
+            <p class="muted small">File activity is ranked by observed operations; consumption is not attributed to individual files.</p>
+            <div class="table-scroll"><table><thead><tr><th>#</th><th>File</th><th>Operations</th></tr></thead><tbody>{file_rows}</tbody></table></div>
+          </div>
+        </details>""")
+    project_detail_sections = "".join(project_details) or '<p class="muted">No projects discovered.</p>'
+
+    model_consumption = total.model_consumption
+    model_items = model_consumption.most_common(OVERALL_HTML_MAX_MODELS)
+    model_rows = "".join(
+        bar_row(
+            short_model(model, 40), score, total.consumption,
+            OVERALL_CATEGORICAL_COLORS[index % len(OVERALL_CATEGORICAL_COLORS)],
+        )
+        for index, (model, score) in enumerate(model_items)
+    )
+    if len(model_consumption) > OVERALL_HTML_MAX_MODELS:
+        other = total.consumption - sum(score for _, score in model_items)
+        model_rows += bar_row("Other models", other, total.consumption, "var(--muted)")
+    model_rows = model_rows or '<p class="muted">Not measured.</p>'
+
+    consumption_parts = (
+        (f"Fresh ×{CONSUMPTION_CONFIG.fresh_weight:g}", total.fresh_consumption, "var(--series-1)"),
+        (f"Cache ×{CONSUMPTION_CONFIG.cache_weight:g}", total.cache_consumption, "var(--series-3)"),
+    )
+    io_segments = "".join(
+        f'<div class="stack-seg" style="width:{pct(value, total.consumption):.2f}%;background:{color}" '
+        f'title="{esc(name)} · {pct(value, total.consumption):.1f}%"></div>'
+        for name, value, color in consumption_parts if value
+    )
+    io_legend = "".join(
+        f'<div class="legend-item"><span class="swatch" style="background:{color}"></span>'
+        f'{esc(name)} · {pct(value, total.consumption):.1f}% · {esc(fmt_consumption(value))}</div>'
+        for name, value, color in consumption_parts
+    )
+
+    trend_days = report.days[-OVERALL_HTML_MAX_TREND_DAYS:]
+    peak = max((day.usage.consumption for day in trend_days), default=0)
+    if trend_days:
+        trend_bars = "".join(
+            f'<div class="trend-bar" style="height:{(day.usage.consumption / peak * 100) if peak else 0:.1f}%" '
+            f'title="{esc(day.day)} · {esc(fmt_consumption(day.usage.consumption))}"></div>'
+            for day in trend_days
+        )
+        trend_section = (
+            f'<div class="trend-chart">{trend_bars}</div>'
+            f'<div class="trend-range muted">{esc(trend_days[0].day)} → {esc(trend_days[-1].day)}'
+            f'{" (most recent " + str(OVERALL_HTML_MAX_TREND_DAYS) + " days)" if len(report.days) > OVERALL_HTML_MAX_TREND_DAYS else ""}'
+            "</div>"
+        )
+    else:
+        trend_section = '<p class="muted">Not measured — no timestamps found in scope.</p>'
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Monitor — Overall consumption report</title>
+<style>
+  :root {{
+    color-scheme: light;
+    --surface: #fcfcfb; --page: #f9f9f7; --text: #0b0b0b; --text-2: #52514e;
+    --muted: #898781; --grid: #e1e0d9; --border: rgba(11,11,11,0.10);
+    --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a; --series-seq: #2a78d6;
+  }}
+  @media (prefers-color-scheme: dark) {{
+    :root {{
+      color-scheme: dark;
+      --surface: #1a1a19; --page: #0d0d0d; --text: #ffffff; --text-2: #c3c2b7;
+      --muted: #898781; --grid: #2c2c2a; --border: rgba(255,255,255,0.10);
+      --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-seq: #3987e5;
+    }}
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0; padding: 32px 16px 64px; background: var(--page); color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }}
+  main {{ max-width: 880px; margin: 0 auto; }}
+  h1 {{ font-size: 20px; margin: 0 0 4px; }}
+  h2 {{ font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-2); margin: 0 0 12px; }}
+  h3 {{ font-size: 13px; margin: 20px 0 10px; }}
+  .meta {{ color: var(--muted); font-size: 12px; margin-bottom: 28px; }}
+  section {{
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    padding: 20px; margin-bottom: 16px;
+  }}
+  .tiles {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; padding: 0; background: none; border: none; }}
+  .tile {{ background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }}
+  .tile-value {{ font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums; }}
+  .tile-label {{ color: var(--text-2); font-size: 12px; margin-top: 4px; }}
+  .bar-row {{ display: grid; grid-template-columns: 160px 1fr 220px; align-items: center; gap: 10px; padding: 5px 0; }}
+  .bar-label {{ font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+  .bar-track {{ height: 10px; background: var(--grid); border-radius: 4px; overflow: hidden; }}
+  .bar-fill {{ display: block; height: 100%; border-radius: 4px; }}
+  .bar-value {{ font-size: 12px; color: var(--text-2); font-variant-numeric: tabular-nums; white-space: nowrap; }}
+  .stack {{ display: flex; height: 14px; border-radius: 4px; overflow: hidden; background: var(--grid); gap: 2px; }}
+  .stack-seg {{ height: 100%; }}
+  .legend {{ display: flex; flex-wrap: wrap; gap: 16px; margin-top: 12px; font-size: 12px; color: var(--text-2); }}
+  .legend-item {{ display: flex; align-items: center; gap: 6px; }}
+  .swatch {{ width: 10px; height: 10px; border-radius: 2px; display: inline-block; }}
+  .trend-chart {{ display: flex; align-items: flex-end; gap: 2px; height: 90px; border-bottom: 1px solid var(--grid); }}
+  .trend-bar {{ flex: 1; background: var(--series-1); border-radius: 2px 2px 0 0; min-height: 1px; }}
+  .trend-range {{ margin-top: 6px; font-size: 11px; }}
+  .project-detail {{ border-top: 1px solid var(--grid); }}
+  .project-detail:first-of-type {{ border-top: 0; }}
+  .project-detail summary {{ display: grid; grid-template-columns: 14px minmax(120px, 180px) 1fr minmax(180px, auto); align-items: center; gap: 10px; padding: 12px 0; cursor: pointer; font-weight: 600; list-style: none; }}
+  .project-detail summary::-webkit-details-marker {{ display: none; }}
+  .project-detail summary::before {{ content: "▸"; color: var(--muted); }}
+  .project-detail[open] summary::before {{ content: "▾"; }}
+  .project-detail summary .bar-track {{ width: 100%; }}
+  .project-name {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+  .summary-value {{ color: var(--text-2); font-weight: 400; white-space: nowrap; }}
+  .detail-body {{ padding: 0 0 18px 16px; }}
+  .session-list {{ border-top: 1px solid var(--grid); }}
+  .session-row {{ padding: 13px 0; border-bottom: 1px solid var(--grid); }}
+  .session-main {{ display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; align-items: baseline; gap: 8px; }}
+  .session-rank {{ color: var(--muted); font-variant-numeric: tabular-nums; }}
+  .session-title {{ min-width: 0; font-weight: 600; overflow-wrap: anywhere; }}
+  .session-score {{ color: var(--series-1); font-size: 14px; font-variant-numeric: tabular-nums; white-space: nowrap; }}
+  .session-meta {{ display: flex; flex-wrap: wrap; gap: 4px 0; margin: 5px 0 0 32px; color: var(--muted); font-size: 11px; line-height: 1.45; }}
+  .session-meta > * {{ display: inline-flex; align-items: baseline; }}
+  .session-meta > * + *::before {{ content: "·"; margin: 0 7px; color: var(--grid); }}
+  .session-meta code {{ color: var(--text-2); overflow-wrap: anywhere; }}
+  .table-scroll {{ overflow-x: auto; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
+  th, td {{ padding: 7px 8px; border-bottom: 1px solid var(--grid); text-align: left; vertical-align: top; }}
+  th {{ color: var(--muted); font-weight: 500; }}
+  td:last-child, th:last-child {{ text-align: right; white-space: nowrap; }}
+  code {{ color: var(--text-2); }}
+  .small {{ font-size: 11px; }}
+  .muted {{ color: var(--muted); }}
+  .unmeasured {{ font-size: 12px; color: var(--muted); border-top: 1px solid var(--grid); margin-top: 16px; padding-top: 12px; }}
+  footer {{ color: var(--muted); font-size: 11px; margin-top: 24px; }}
+  @media (max-width: 680px) {{
+    .bar-row {{ grid-template-columns: 110px 1fr; }}
+    .bar-row .bar-value {{ grid-column: 2; }}
+    .project-detail summary {{ grid-template-columns: 14px 1fr auto; }}
+    .project-detail summary .bar-track {{ display: none; }}
+    .detail-body {{ padding-left: 0; }}
+    .session-main {{ grid-template-columns: 20px minmax(0, 1fr); }}
+    .session-score {{ grid-column: 2; margin-top: 3px; }}
+    .session-meta {{ margin-left: 28px; }}
+  }}
+</style>
+</head>
+<body>
+<main>
+  <h1>Overall consumption report</h1>
+  <div class="meta">Generated {esc(generated_at)} · {esc(scope_note)}</div>
+
+  <section class="tiles">{kpi_tiles}</section>
+
+  <section>
+    <h2>Provider / source split</h2>
+    {provider_rows}
+  </section>
+
+  <section>
+    <h2>Projects</h2>
+    {project_detail_sections}
+  </section>
+
+  <section>
+    <h2>Model split</h2>
+    {model_rows}
+  </section>
+
+  <section>
+    <h2>Consumption basis</h2>
+    <div class="stack">{io_segments}</div>
+    <div class="legend">{io_legend}</div>
+    <div class="muted" style="margin-top:8px;font-size:12px;">
+      {total.cache_hit_rate:.0f}% cached across all observed session context
+    </div>
+  </section>
+
+  <section>
+    <h2>Time trend</h2>
+    {trend_section}
+  </section>
+
+  <div class="unmeasured">
+    Consumption is a configurable heuristic: fresh × {CONSUMPTION_CONFIG.fresh_weight:g} plus
+    cache-read × {CONSUMPTION_CONFIG.cache_weight:g}. It is not a price, billed amount, or direct
+    compute measurement. Sessions this tool could not parse are excluded from every score above and
+    counted separately in the scope line.
+  </div>
+
+  <footer>agent-monitor · offline, self-contained report · no external assets or network requests</footer>
+</main>
+</body>
+</html>
+"""
+
+
+def write_overall_report(report: OverallReport) -> tuple[bool, str]:
+    path = default_overall_report_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        generated_at = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        path.write_text(render_overall_html(report, generated_at), encoding="utf-8")
+    except OSError as exc:
+        return False, f"export failed: {exc}"
+    return True, f"saved {path}"
+
+
+def open_overall_report(path: Path | None = None) -> tuple[bool, str]:
+    """Open an exported report without blocking the curses event loop."""
+    target = path or default_overall_report_path()
+    if os.environ.get("AGENT_MONITOR_NO_BROWSER"):
+        return True, f"saved {target} · browser opening disabled"
+    try:
+        subprocess.Popen(
+            ("open", str(target)), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return False, f"saved {target} · could not open browser: {exc}"
+    return True, f"opened in browser · {target}"
 
 
 def request_detail_lines(request: RequestInfo, index: int, width: int) -> list[str]:
@@ -2193,6 +3173,19 @@ def fit_action_bar(full: str, compact: str, width: int) -> str:
     return truncate(value, available).ljust(available)
 
 
+def fit_status_bar(action_bar: str, status: str, width: int) -> str:
+    """Reserve the bottom bar's right edge for global progress and notices."""
+    available = max(1, width - 1)
+    if not status:
+        return truncate_terminal_layout(action_bar, available).ljust(available)
+    status = truncate_terminal(status, max(1, available - min(14, available)))
+    status_width = terminal_width(status)
+    left_budget = max(0, available - status_width - 2)
+    left = truncate_terminal_layout(action_bar.strip(), left_budget) if left_budget else ""
+    gap = max(0, available - terminal_width(left) - status_width)
+    return left + " " * gap + status
+
+
 def file_path_span(text: str) -> tuple[int, int] | None:
     """Locate a rendered tool/file path so it can be visually de-emphasized."""
     marker = " · "
@@ -2249,6 +3242,20 @@ class TTYApp:
         self.search_query = ""
         self.search_matches: list[int] = []
         self.search_position = -1
+        self.search_return_mode = "list"
+        self.overall_report: OverallReport | None = None
+        self.overall_offset = 0
+        self.transient_status = ""
+        self.transient_status_until = 0.0
+        self.overall_load_state = "idle"
+        self.overall_load_progress = 0
+        self.overall_load_total = 0
+        self.overall_load_error = ""
+        self.overall_thread: threading.Thread | None = None
+        self.overall_project_cursor = 0
+        self.project_session_cursor = 0
+        self.selected_project = ""
+        self.jump_return: tuple[str, str] | None = None
         self.last_mtime = -1.0
         self.last_refresh = 0.0
         self.analyzer = cache.analyzer(path) if cache else create_analyzer(path)
@@ -2301,7 +3308,10 @@ class TTYApp:
         prefix = f"< · {provider} · "
         suffix = f" · {self.status} · >"
         stem_width = max(1, width - len(prefix) - len(suffix))
-        return truncate_layout(prefix + truncate(Path(self.path).stem, stem_width) + suffix, width)
+        identity = Path(self.path).stem
+        if self.analysis.provider == "codex":
+            identity = display_rollout_id(identity)
+        return truncate_layout(prefix + truncate(identity, stem_width) + suffix, width)
 
     def select_provider(self, target_provider: str) -> None:
         current_provider = session_provider(self.path)
@@ -2313,6 +3323,7 @@ class TTYApp:
         ]
         if not candidates:
             self.status = f"no {target_provider} sessions"
+            self.set_status_area(f"No {target_provider} sessions found")
             return
         self.provider_positions[current_provider] = self.path
         target = self.provider_positions.get(target_provider, candidates[0])
@@ -2331,6 +3342,104 @@ class TTYApp:
         self.refresh(force=True)
         if self.search_query:
             self.update_search()
+
+    def activate_session_path(
+        self, path: str, open_detail: bool = False, return_mode: str | None = None,
+    ) -> bool:
+        """Switch to a discovered session, optionally opening its first prompt detail."""
+        if not path or not Path(path).is_file():
+            self.status = "session file unavailable"
+            self.set_status_area("Session file unavailable")
+            return False
+        if return_mode is not None:
+            self.jump_return = (self.path, return_mode)
+        current_provider = session_provider(self.path)
+        target_provider = session_provider(path)
+        self.provider_positions[current_provider] = self.path
+        discovered = find_all_sessions()
+        if path not in discovered:
+            discovered.insert(0, path)
+        self.all_session_paths = discovered
+        self.session_paths = [
+            item for item in discovered if session_provider(item) == target_provider
+        ]
+        self.session_index = self.session_paths.index(path)
+        self.path = path
+        self.provider_positions[target_provider] = path
+        self.analyzer = self.cache.analyzer(path) if self.cache else create_analyzer(path)
+        self.analysis = self.analyzer.analysis
+        self.last_record_count = self.analysis.record_count
+        self.view, self.follow, self.new_events = 1, True, 0
+        self.mode = "list"
+        self.cursor, self.offset = {1: 0, 2: 0}, {1: 0, 2: 0}
+        self.last_mtime = -1.0
+        self.refresh(force=True)
+        if open_detail and self.analysis.prompts:
+            prompt_index = self.analysis.prompts[0].index
+            self.cursor[1] = self.prompt_anchor(prompt_index)
+            self.selected_prompt = prompt_index
+            self.detail_page, self.detail_cursor, self.detail_offset = "prompt", 0, 0
+            self.follow = False
+            self.mode = "detail"
+        return True
+
+    def return_from_jump(self) -> bool:
+        """Restore the session and page that initiated a cross-session jump."""
+        if self.jump_return is None:
+            return False
+        path, mode = self.jump_return
+        self.jump_return = None
+        if not self.activate_session_path(path):
+            return False
+        self.mode = mode
+        return True
+
+    def find_session_path(self, reference: str) -> str | None:
+        """Resolve a full logical session ID or rollout filename from the catalog."""
+        needle = reference.strip().removeprefix("#")
+        if not needle:
+            return None
+        paths = find_all_sessions()
+        exact: list[str] = []
+        prefix: list[str] = []
+        for path in paths:
+            logical_id = session_identifier(path)
+            rollout = Path(path).stem
+            identities = (logical_id, rollout, display_rollout_id(rollout))
+            if needle in identities:
+                exact.append(path)
+            elif any(value.startswith(needle) for value in identities):
+                prefix.append(path)
+        return (exact or prefix or [None])[0]
+
+    def selected_project_usage(self) -> ProjectUsage | None:
+        if not self.overall_report:
+            return None
+        return next(
+            (item for item in self.overall_report.projects if item.root == self.selected_project), None,
+        )
+
+    def begin_search(self) -> None:
+        self.search_return_mode = self.mode
+        self.search_query = ""
+        self.mode = "search"
+
+    def set_status_area(self, message: str, duration: float = 10.0) -> None:
+        self.transient_status = message
+        self.transient_status_until = time.monotonic() + duration if duration else 0.0
+        self.previous_frame = []
+
+    def status_area(self) -> str:
+        """Return the global bottom-right status, independent of the active page."""
+        if self.overall_load_state == "loading":
+            spinner = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.monotonic() * 10) % 10]
+            done, total = self.overall_load_progress, self.overall_load_total
+            progress = f" {done}/{total} ({done / total:.0%})" if total else ""
+            return f"{spinner} Processing overall…{progress}"
+        if self.transient_status and time.monotonic() >= self.transient_status_until:
+            self.transient_status = ""
+            self.transient_status_until = 0.0
+        return self.transient_status
 
     def refresh(self, force: bool = False) -> None:
         now = time.monotonic()
@@ -2490,20 +3599,97 @@ class TTYApp:
         else:
             self.cursor[2] = min(match, max(0, len(self.history) - 1))
 
-    def handle_key(self, key: int) -> bool:
+    def open_overall(self, force: bool = False) -> None:
+        self.mode = "overall"
+        self.overall_offset = 0
+        if self.overall_load_state == "loading":
+            return
+        if force or self.overall_load_state in {"idle", "error"}:
+            self.overall_report = None
+            self.overall_project_cursor = 0
+            self.overall_load_state = "loading"
+            self.overall_load_progress = 0
+            self.overall_load_total = 0
+            self.overall_load_error = ""
+            cache_path = str(self.cache.path) if self.cache else None
+
+            def update_progress(done: int, total: int) -> None:
+                self.overall_load_progress = done
+                self.overall_load_total = total
+
+            def load() -> None:
+                background_cache: ProfilerCache | None = None
+                try:
+                    if cache_path:
+                        background_cache = ProfilerCache(cache_path)
+                    self.overall_report = build_overall_report(background_cache, progress=update_progress)
+                    self.overall_load_state = "ready"
+                    self.set_status_area(
+                        f"Overall ready · {self.overall_report.session_count} sessions",
+                    )
+                except Exception as exc:  # keep background failures visible without killing the TUI
+                    self.overall_load_error = str(exc)
+                    self.overall_load_state = "error"
+                    self.set_status_area("Overall processing failed")
+                finally:
+                    if background_cache is not None:
+                        background_cache.db.close()
+                    self.previous_frame = []
+
+            self.overall_thread = threading.Thread(
+                target=load, name="agent-monitor-overall", daemon=True,
+            )
+            self.overall_thread.start()
+
+    def export_overall_report(self) -> None:
+        if self.overall_load_state == "loading":
+            done, total = self.overall_load_progress, self.overall_load_total
+            progress = f" ({done}/{total})" if total else ""
+            self.set_status_area(f"Overall is still processing{progress}")
+            return
+        if self.overall_report is None:
+            self.set_status_area("Report unavailable · press r to retry")
+            return
+        ok, message = write_overall_report(self.overall_report)
+        if not ok:
+            self.set_status_area(message)
+            return
+        opened, open_message = open_overall_report()
+        self.set_status_area(message if opened else f"{message} · {open_message}")
+
+    def handle_key(self, key: int | str) -> bool:
+        text_key = key if isinstance(key, str) else ""
+        if isinstance(key, str):
+            key = ord(key) if len(key) == 1 else -1
         if self.mode == "search":
             if key == 27:
-                self.mode = "list"
+                self.mode = self.search_return_mode
             elif key in (10, 13, curses.KEY_ENTER):
-                self.update_search()
-                self.mode = "list"
-                if self.search_matches:
-                    self.search_position = -1
-                    self.search_next(1)
+                if self.search_query.startswith("#"):
+                    path = self.find_session_path(self.search_query)
+                    if path:
+                        self.activate_session_path(
+                            path, open_detail=True, return_mode=self.search_return_mode,
+                        )
+                    else:
+                        self.mode = self.search_return_mode
+                        self.status = f"session not found: {self.search_query[1:]}"
+                        self.set_status_area(f"Session not found: {self.search_query[1:]}")
+                else:
+                    self.update_search()
+                    self.mode = "list"
+                    if self.search_matches:
+                        self.search_position = -1
+                        self.search_next(1)
             elif key in (curses.KEY_BACKSPACE, 127, 8):
                 self.search_query = self.search_query[:-1]
+            elif text_key and text_key.isprintable():
+                self.search_query += text_key
             elif 32 <= key <= 126:
                 self.search_query += chr(key)
+            return True
+        if key == ord("/") and self.mode in {"list", "overall", "project"}:
+            self.begin_search()
             return True
         if self.mode == "help":
             if key in (27, curses.KEY_LEFT, ord("?"), ord("q")):
@@ -2542,6 +3728,76 @@ class TTYApp:
                 elif key == curses.KEY_END:
                     self.process_follow = True
             return True
+        if self.mode == "overall":
+            if key == ord("q"):
+                return False
+            if key in (ord("p"), ord("P")):
+                self.export_overall_report()
+            elif key in (27, curses.KEY_LEFT, ord("o"), ord("O")):
+                self.mode = "list"
+            elif key == curses.KEY_DOWN:
+                if self.overall_report and self.overall_report.projects:
+                    self.overall_project_cursor = min(
+                        len(self.overall_report.projects) - 1, self.overall_project_cursor + 1,
+                    )
+            elif key == curses.KEY_UP:
+                self.overall_project_cursor = max(0, self.overall_project_cursor - 1)
+            elif key == curses.KEY_NPAGE:
+                self.overall_offset += max(1, self.screen.getmaxyx()[0] - 5)
+            elif key == curses.KEY_PPAGE:
+                self.overall_offset = max(0, self.overall_offset - max(1, self.screen.getmaxyx()[0] - 5))
+            elif key == curses.KEY_HOME:
+                self.overall_project_cursor = 0
+                self.overall_offset = 0
+            elif key in (10, 13, curses.KEY_ENTER, curses.KEY_RIGHT):
+                if self.overall_report and self.overall_report.projects:
+                    project = self.overall_report.projects[self.overall_project_cursor]
+                    self.selected_project = project.root
+                    self.detail_offset = 0
+                    self.project_session_cursor = 0
+                    self.mode = "project"
+            elif key == ord("r"):
+                self.open_overall(force=True)
+            return True
+        if self.mode == "project":
+            if key == ord("q"):
+                return False
+            if key in (27, curses.KEY_LEFT):
+                self.mode = "overall"
+            elif key in (ord("p"), ord("P")):
+                self.export_overall_report()
+            elif key == curses.KEY_DOWN:
+                project = self.selected_project_usage()
+                sessions = sorted(
+                    project.recent_sessions, key=lambda item: item.usage.consumption, reverse=True,
+                )[:5] if project else []
+                if sessions:
+                    self.project_session_cursor = min(
+                        len(sessions) - 1, self.project_session_cursor + 1,
+                    )
+                else:
+                    self.detail_offset += 1
+            elif key == curses.KEY_UP:
+                self.project_session_cursor = max(0, self.project_session_cursor - 1)
+            elif key == curses.KEY_NPAGE:
+                self.detail_offset += max(1, self.screen.getmaxyx()[0] - 5)
+            elif key == curses.KEY_PPAGE:
+                self.detail_offset = max(0, self.detail_offset - max(1, self.screen.getmaxyx()[0] - 5))
+            elif key == curses.KEY_HOME:
+                self.detail_offset = 0
+                self.project_session_cursor = 0
+            elif key in (10, 13, curses.KEY_ENTER, curses.KEY_RIGHT):
+                project = self.selected_project_usage()
+                sessions = sorted(
+                    project.recent_sessions, key=lambda item: item.usage.consumption, reverse=True,
+                )[:5] if project else []
+                if sessions:
+                    session = sessions[min(self.project_session_cursor, len(sessions) - 1)]
+                    self.activate_session_path(session.path, return_mode="project")
+            return True
+        if key in (27, curses.KEY_LEFT) and self.mode in {"list", "detail"}:
+            if self.return_from_jump():
+                return True
         if key == ord("q"):
             return False
         if key == ord("z"):
@@ -2553,6 +3809,9 @@ class TTYApp:
                 index = max(0, min(self.cursor[self.view], len(items) - 1))
                 self.selected_prompt = items[index][0]
             self.mode, self.process_cursor, self.process_offset = "processes", 0, 0
+            return True
+        if key in (ord("o"), ord("O")) and self.mode == "list":
+            self.open_overall()
             return True
         if key == ord("x"):
             self.select_provider("codex")
@@ -2570,6 +3829,7 @@ class TTYApp:
                 except (ValueError, IndexError):
                     command_text = ""
                 self.clipboard_notice = "copied" if copy_to_clipboard(command_text) else "nothing to copy"
+                self.set_status_area(self.clipboard_notice.capitalize())
                 return True
             if self.detail_page == "prompt":
                 if key == curses.KEY_DOWN: self.detail_cursor = min(5, self.detail_cursor + 1)
@@ -2587,10 +3847,7 @@ class TTYApp:
             if key in (10, 13, curses.KEY_ENTER, curses.KEY_RIGHT):
                 self.open_detail_selection()
             return True
-        if key == ord("/"):
-            self.search_query = ""
-            self.mode = "search"
-        elif key == ord("?"):
+        if key == ord("?"):
             self.mode = "help"
         elif key == ord("n"):
             self.search_next(1)
@@ -2713,6 +3970,77 @@ class TTYApp:
                 f" DETAIL │ Tab │ f {follow} │ ← back",
                 width,
             )
+        elif self.mode == "overall":
+            rows.append((" Overall consumption across discovered sessions", curses.A_BOLD))
+            rows.append(("", 0))
+            if self.overall_load_state == "loading":
+                pass
+            elif self.overall_load_state == "error":
+                rows.extend([
+                    ("  Could not build the overall report", curses.A_BOLD),
+                    (f"  {truncate_layout(self.overall_load_error, width - 3)}", 0),
+                    ("  Press r to try again.", 0),
+                ])
+            elif self.overall_report is None:
+                rows.append(("  No overall report loaded. Press r to load it.", 0))
+            else:
+                lines = overall_lines(self.overall_report, width - 3)
+                visible_height = max(1, body_height - 2)
+                max_offset = max(0, len(lines) - visible_height)
+                self.overall_offset = min(self.overall_offset, max_offset)
+                project_lines = overall_project_line_indices(lines)
+                if project_lines:
+                    self.overall_project_cursor = min(self.overall_project_cursor, len(project_lines) - 1)
+                    selected_line = project_lines[self.overall_project_cursor]
+                    if selected_line < self.overall_offset:
+                        self.overall_offset = selected_line
+                    elif selected_line >= self.overall_offset + visible_height:
+                        self.overall_offset = selected_line - visible_height + 1
+                for line_index, line in enumerate(
+                    lines[self.overall_offset:self.overall_offset + visible_height], self.overall_offset,
+                ):
+                    selected = bool(project_lines) and line_index == project_lines[self.overall_project_cursor]
+                    attr = curses.A_REVERSE if selected else (curses.A_BOLD if line in OVERALL_SECTIONS else 0)
+                    prefix = "> " if selected else "  "
+                    rows.append((prefix + truncate_layout(line, width - len(prefix) - 1), attr))
+            export_action = "p/P export + open" if self.overall_load_state == "ready" else "p/P after loading"
+            footer = fit_action_bar(
+                f" OVERALL │ ↑/↓ project │ → open │ PgUp/PgDn scroll │ {export_action} │ r refresh │ ← back │ q quit",
+                f" OVERALL │ ↑/↓ project │ → open │ {export_action} │ ← back",
+                width,
+            )
+        elif self.mode == "project":
+            project = self.selected_project_usage()
+            if project is None:
+                lines = ["Project not found"]
+            else:
+                lines = project_detail_lines(project, width - 3)
+            visible_height = max(1, body_height)
+            max_offset = max(0, len(lines) - visible_height)
+            self.detail_offset = min(self.detail_offset, max_offset)
+            session_lines = project_session_line_indices(lines)
+            if session_lines:
+                self.project_session_cursor = min(self.project_session_cursor, len(session_lines) - 1)
+                selected_line = session_lines[self.project_session_cursor]
+                if selected_line < self.detail_offset:
+                    self.detail_offset = selected_line
+                elif selected_line >= self.detail_offset + visible_height:
+                    self.detail_offset = selected_line - visible_height + 1
+            for line_index, line in enumerate(
+                lines[self.detail_offset:self.detail_offset + visible_height], self.detail_offset,
+            ):
+                selected = bool(session_lines) and line_index == session_lines[self.project_session_cursor]
+                attr = (
+                    curses.A_REVERSE if selected
+                    else curses.A_BOLD if line in PROJECT_DETAIL_SECTIONS or (project and line == project.name)
+                    else 0
+                )
+                rows.append((("> " if selected else "  ") + truncate_terminal_layout(line, width - 3), attr))
+            footer = fit_action_bar(
+                " PROJECT │ ↑/↓ session │ → jump │ / search or #id │ PgUp/PgDn scroll │ p/P export + open │ ← overall │ q quit",
+                " PROJECT │ ↑/↓ session │ → jump │ / search │ p export │ ← overall",
+                width,
+            )
         elif self.mode == "detail":
             prompt = self.selected_prompt_turn()
             if prompt and self.detail_page.startswith("actor:"):
@@ -2765,10 +4093,9 @@ class TTYApp:
                 prefix = "> " if enterable else "  "
                 rows.append((prefix + truncate_layout(line, width - len(prefix) - 1), attr))
             if self.detail_page.startswith("request:"):
-                notice = f" │ {self.clipboard_notice}" if self.clipboard_notice else ""
                 footer = fit_action_bar(
-                    f" REQUEST DETAIL │ ↑/↓ scroll │ y copy command{notice} │ ← back │ q quit",
-                    f" DETAIL │ ↑/↓ │ y copy{notice} │ ← back",
+                    " REQUEST DETAIL │ ↑/↓ scroll │ y copy command │ ← back │ q quit",
+                    " DETAIL │ ↑/↓ │ y copy │ ← back",
                     width,
                 )
             else:
@@ -2791,6 +4118,7 @@ class TTYApp:
                 "z           Claude sessions",
                 "x           Codex sessions",
                 "p           Spawned background agents for this session",
+                "o / O       Overall consumption page (all discovered sessions)",
                 "/           Search current view",
                 "n / N       Next / previous search result",
                 "q           Quit",
@@ -2799,10 +4127,10 @@ class TTYApp:
                 rows.append((" " + line, curses.A_BOLD if line == "Help" else 0))
             footer = fit_action_bar(" HELP │ esc back │ ? close │ q back", " HELP │ esc/? back", width)
         elif self.mode == "search":
-            rows.append((" Search the current view", curses.A_BOLD))
+            rows.append((" Search prompts, or enter #full-session-id", curses.A_BOLD))
             rows.append(("", 0))
             rows.append((f" /{self.search_query}", 0))
-            footer = fit_action_bar(" SEARCH │ type query │ ↵ apply │ esc cancel", " SEARCH │ ↵ apply │ esc", width)
+            footer = fit_action_bar(" SEARCH │ Unicode supported │ #id jumps to detail │ ↵ open/apply │ esc cancel", " SEARCH │ #id jump │ ↵ apply │ esc", width)
         else:
             items = self.current_items()
             cursor = self.cursor[self.view]
@@ -2821,28 +4149,28 @@ class TTYApp:
                 ))
             if self.view == 1 and self.follow:
                 footer = fit_action_bar(
-                    " FOLLOW │ ↑/↓ prompt │ → open │ p processes │ / search │ ? help │ q quit",
-                    " FOLLOW │ ↑/↓ │ → open │ p processes │ / │ ? │ q",
+                    " FOLLOW │ ↑/↓ prompt │ → open │ p processes │ o overall │ / search │ ? help │ q quit",
+                    " FOLLOW │ ↑/↓ │ → open │ p processes │ o overall │ / │ ? │ q",
                     width,
                 )
             elif self.view == 1:
                 updates = f"{self.new_events} updates │ " if self.new_events else ""
                 footer = fit_action_bar(
-                    f" PAUSED │ {updates}End follow │ ↑/↓ prompt │ → open │ p processes │ / search │ ? help │ q quit",
-                    f" PAUSED │ {updates}End follow │ → open │ p processes │ / │ ? │ q",
+                    f" PAUSED │ {updates}End follow │ ↑/↓ prompt │ → open │ p processes │ o overall │ / search │ ? help │ q quit",
+                    f" PAUSED │ {updates}End follow │ → open │ p processes │ o overall │ / │ ? │ q",
                     width,
                 )
             else:
                 footer = fit_action_bar(
-                    " HISTORY │ ↑/↓ prompt │ → open │ p processes │ / search │ ? help │ q quit",
-                    " HISTORY │ ↑/↓ │ → open │ p processes │ / │ ? │ q",
+                    " HISTORY │ ↑/↓ prompt │ → open │ p processes │ o overall │ / search │ ? help │ q quit",
+                    " HISTORY │ ↑/↓ │ → open │ p processes │ o overall │ / │ ? │ q",
                     width,
                 )
 
         while len(rows) < height - 1:
             rows.append(("", 0))
         rows = rows[:height - 1]
-        rows.append((footer, curses.A_REVERSE))
+        rows.append((fit_status_bar(footer, self.status_area(), width), curses.A_REVERSE))
         return rows
 
     def draw(self) -> None:
@@ -2908,8 +4236,11 @@ class TTYApp:
         while True:
             self.refresh()
             self.draw()
-            key = self.screen.getch()
-            if key != -1 and not self.handle_key(key):
+            try:
+                key = self.screen.get_wch()
+            except curses.error:
+                continue
+            if not self.handle_key(key):
                 break
 
 

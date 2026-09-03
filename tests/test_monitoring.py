@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import termios
+import threading
 import time
 import unittest
 import struct
@@ -26,6 +27,32 @@ def prompt(text="Run review"):
     return {
         "type": "user", "timestamp": "2026-07-20T10:00:00Z",
         "sessionId": "fixture", "message": {"content": text},
+    }
+
+
+def ts(value):
+    """Epoch seconds for an ISO-8601 UTC timestamp, used as a mocked session file mtime."""
+    return monitoring.parse_iso_timestamp(value).replace(tzinfo=monitoring.dt.timezone.utc).timestamp()
+
+
+def prompt_with_cwd(cwd, text="Run review", timestamp="2026-07-20T10:00:00Z"):
+    return {
+        "type": "user", "timestamp": timestamp,
+        "sessionId": "fixture", "cwd": cwd, "message": {"content": text},
+    }
+
+
+def assistant_usage(model="claude-fable", inp=10, out=5, cache_create=0, cache_read=0, timestamp="2026-07-20T10:00:01Z"):
+    return {
+        "type": "assistant", "timestamp": timestamp,
+        "message": {
+            "model": model,
+            "usage": {
+                "input_tokens": inp, "output_tokens": out,
+                "cache_creation_input_tokens": cache_create, "cache_read_input_tokens": cache_read,
+            },
+            "content": [{"type": "text", "text": "ok"}],
+        },
     }
 
 
@@ -221,6 +248,46 @@ class SessionDiscoveryTests(unittest.TestCase):
                 entries = monitoring.find_all_session_entries()
 
             self.assertEqual(entries, [(200.0, str(newer_chat)), (100.0, str(current_shard))])
+
+    def test_claude_sessions_are_ordered_by_last_timestamped_record_not_mtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "claude" / "-Users-me-work-lms"
+            root.mkdir(parents=True)
+            old = root / "old.jsonl"
+            recent = root / "recent.jsonl"
+            old.write_text(
+                json.dumps(prompt_with_cwd("/work/lms", timestamp="2026-07-01T09:00:00Z")) + "\n"
+                + json.dumps(assistant_usage(timestamp="2026-07-01T09:01:00Z")) + "\n"
+                # Bookkeeping Claude Code appends when an old transcript is listed/resumed: no timestamp.
+                + json.dumps({"type": "last-prompt"}) + "\n" + json.dumps({"type": "mode"}) + "\n",
+                encoding="utf-8",
+            )
+            recent.write_text(
+                json.dumps(prompt_with_cwd("/work/lms", timestamp="2026-08-20T09:00:00Z")) + "\n"
+                + json.dumps(assistant_usage(timestamp="2026-08-20T09:01:00Z")) + "\n",
+                encoding="utf-8",
+            )
+            no_stamp = root / "no-stamp.jsonl"
+            no_stamp.write_text(json.dumps({"type": "mode"}) + "\n", encoding="utf-8")
+            # The stale transcript was touched most recently, yet it must not be ranked newest.
+            os.utime(recent, (ts("2026-08-20T09:01:00Z"), ts("2026-08-20T09:01:00Z")))
+            os.utime(old, (ts("2026-09-03T12:00:00Z"), ts("2026-09-03T12:00:00Z")))
+            os.utime(no_stamp, (ts("2026-06-01T00:00:00Z"), ts("2026-06-01T00:00:00Z")))
+
+            with (
+                mock.patch.object(monitoring, "default_projects_dir", return_value=Path(directory) / "claude"),
+                mock.patch.object(monitoring, "codex_chats", return_value=[]),
+            ):
+                entries = monitoring.find_all_session_entries()
+
+            self.assertEqual(
+                entries,
+                [
+                    (ts("2026-08-20T09:01:00Z"), str(recent)),
+                    (ts("2026-07-01T09:01:00Z"), str(old)),
+                    (ts("2026-06-01T00:00:00Z"), str(no_stamp)),  # mtime fallback
+                ],
+            )
 
     def test_codex_fallback_groups_shards_and_excludes_subagents(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -680,6 +747,68 @@ class TTYIntegrationTests(unittest.TestCase):
             os.close(master)
             fixture.close()
 
+    def test_overall_page_opens_and_exports_in_a_real_pty(self):
+        fixture = SessionFixture([prompt(), assistant_usage()])
+        with tempfile.TemporaryDirectory() as fake_home:
+            master, slave = pty.openpty()
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
+            env = dict(
+                os.environ, TERM="xterm-256color", HOME=fake_home,
+                PYTHONPYCACHEPREFIX="/tmp/monitoring-test-pycache",
+                AGENT_MONITOR_NO_BROWSER="1",
+            )
+            process = subprocess.Popen(
+                [sys.executable, str(ROOT / "monitoring.py"), fixture.path],
+                stdin=slave, stdout=slave, stderr=slave, env=env, close_fds=True,
+            )
+            os.close(slave)
+            output = b""
+
+            def drain(seconds=0.4):
+                nonlocal output
+                deadline = time.time() + seconds
+                while time.time() < deadline:
+                    ready, _, _ = select.select([master], [], [], 0.05)
+                    if ready:
+                        try:
+                            output += os.read(master, 65536)
+                        except OSError:
+                            break
+
+            try:
+                deadline = time.time() + 4
+                while time.time() < deadline and b"Execution Profiler" not in output:
+                    ready, _, _ = select.select([master], [], [], 0.2)
+                    if ready:
+                        output += os.read(master, 65536)
+                os.write(master, b"o")  # open the Overall page — no ~/.claude or ~/.codex under fake_home
+                drain(1.0)
+                self.assertIn(b"Overall consumption across discovered sessions", output)
+                self.assertIn(b"Not measured", output)
+                os.write(master, b"p")  # export the HTML report
+                drain(0.6)
+                self.assertIn(b"saved", output)
+                report_path = Path(fake_home) / "Library" / "Caches" / "execution-profiler" / "overall-report.html"
+                self.assertTrue(report_path.is_file())
+                self.assertIn("<!doctype html>", report_path.read_text(encoding="utf-8"))
+                os.write(master, b"q")
+                deadline = time.time() + 3
+                while process.poll() is None and time.time() < deadline:
+                    ready, _, _ = select.select([master], [], [], 0.1)
+                    if ready:
+                        try:
+                            output += os.read(master, 65536)
+                        except OSError:
+                            break
+                process.wait(timeout=1)
+                self.assertEqual(process.returncode, 0, output.decode("utf-8", "replace"))
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+                os.close(master)
+                fixture.close()
+
     def test_sqlite_cache_restores_state_and_ingests_only_appended_records(self):
         fixture = SessionFixture([prompt()])
         cache_file = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
@@ -750,6 +879,26 @@ class FrameAffordanceTests(unittest.TestCase):
         self.assertEqual(app.session_navigation_availability(), (False, True))
         app.session_index = 1
         self.assertEqual(app.session_navigation_availability(), (True, False))
+
+    def test_codex_chat_header_uses_short_rollout_display_id(self):
+        path = (
+            "/tmp/rollout-2026-09-03T16-30-06-"
+            "01a0669a-a7a5-71f1-8431-59a6fa3c6ce0.jsonl"
+        )
+        app = object.__new__(monitoring.TTYApp)
+        app.analysis = monitoring.Analysis(
+            path, [], monitoring.Usage(), 0, 0, provider="codex",
+        )
+        app.path = path
+        app.status = "20:06:31"
+
+        header = app.session_header(120)
+
+        self.assertIn(
+            "rollout-2026-09-03T16-30-06-01a0669a-a7a5-71f1-8431",
+            header,
+        )
+        self.assertNotIn("59a6fa3c6ce0", header)
 
     def test_process_clock_renders_local_started_and_finished_times(self):
         timestamp = "2026-07-20T10:11:12+00:00"
@@ -1068,6 +1217,668 @@ class FrameAffordanceTests(unittest.TestCase):
             self.assertEqual(app.mode, "list")
         finally:
             fixture.close()
+
+
+class OverallPageTests(unittest.TestCase):
+    def test_usage_tracks_raw_telemetry_and_weighted_consumption_per_model(self):
+        usage = monitoring.Usage()
+        usage.add("model-a", 10, 5, 2, 3)
+        usage.add("model-b", 1, 1, 0, 0)
+        usage.add("model-a", 4, 4, 0, 0)
+        self.assertEqual(usage.model_totals["model-a"], 10 + 5 + 2 + 3 + 4 + 4)
+        self.assertEqual(usage.model_totals["model-b"], 2)
+        self.assertEqual(sum(usage.model_totals.values()), usage.total)
+        self.assertAlmostEqual(usage.consumption, usage.fresh + usage.cache_read * 0.1)
+        self.assertAlmostEqual(
+            sum(usage.model_consumption.values()), usage.consumption,
+        )
+
+        other = monitoring.Usage()
+        other.add("model-a", 1, 1, 1, 1)
+        usage.merge(other)
+        self.assertEqual(usage.model_totals["model-a"], 10 + 5 + 2 + 3 + 4 + 4 + 4)
+        self.assertEqual(sum(usage.model_totals.values()), usage.total)
+
+    def test_consumption_weight_config_rejects_invalid_values(self):
+        with mock.patch.dict(os.environ, {"WEIGHT": "0.25"}):
+            self.assertEqual(monitoring.configured_weight("WEIGHT", 1.0), 0.25)
+        with mock.patch.dict(os.environ, {"WEIGHT": "invalid"}):
+            self.assertEqual(monitoring.configured_weight("WEIGHT", 1.0), 1.0)
+        with mock.patch.dict(os.environ, {"WEIGHT": "-1"}):
+            self.assertEqual(monitoring.configured_weight("WEIGHT", 1.0), 1.0)
+
+    def test_session_cache_percentage_uses_every_request_not_only_latest(self):
+        fixture = SessionFixture([
+            prompt("First"),
+            assistant_usage(inp=100, out=0, cache_read=900),
+            {**prompt("Second"), "timestamp": "2026-07-20T10:01:00Z"},
+            assistant_usage(inp=1_000, out=0, cache_read=0, timestamp="2026-07-20T10:01:01Z"),
+        ])
+        try:
+            analysis = monitoring.create_analyzer(fixture.path).analysis
+            latest, peak, cache_rate = monitoring.session_context_summary([analysis])
+            self.assertEqual(latest, 1_000)
+            self.assertEqual(peak, 1_000)
+            self.assertEqual(cache_rate, 45.0)
+        finally:
+            fixture.close()
+
+    def test_consumption_ranking_discounts_cache_reads(self):
+        project = monitoring.ProjectUsage("weighted")
+        cache_heavy = monitoring.Usage()
+        cache_heavy.add("opus-5", 50_000_000, 5_000_000, 0, 250_000_000)
+        fresh_heavy = monitoring.Usage()
+        fresh_heavy.add("fable-5", 130_000_000, 10_000_000, 0, 0)
+        project.usage.merge(cache_heavy)
+        project.usage.merge(fresh_heavy)
+        project.recent_sessions.extend([
+            monitoring.SessionUsage(
+                "cache-heavy", "", 1, "Cache-heavy", "2026-09-03", "claude", cache_heavy,
+            ),
+            monitoring.SessionUsage(
+                "fresh-heavy", "", 1, "Fresh-heavy", "2026-09-03", "claude", fresh_heavy,
+            ),
+        ])
+
+        lines = monitoring.project_detail_lines(project, 120)
+        ranked = [line for line in lines if line.startswith(("1. ", "2. "))]
+
+        self.assertAlmostEqual(cache_heavy.consumption, 80_000_000)
+        self.assertAlmostEqual(fresh_heavy.consumption, 140_000_000)
+        self.assertIn("Fresh-heavy", ranked[0])
+        self.assertIn("Cache-heavy", ranked[1])
+
+    def test_build_overall_report_groups_projects_providers_and_models(self):
+        claude_alpha = SessionFixture([
+            prompt_with_cwd("/work/alpha", timestamp="2026-07-20T09:00:00Z"),
+            assistant_usage(model="claude-sonnet-5", inp=100, out=50, cache_read=200, timestamp="2026-07-20T09:00:01Z"),
+        ])
+        claude_beta = SessionFixture([
+            prompt_with_cwd("/work/beta", timestamp="2026-07-21T09:00:00Z"),
+            assistant_usage(model="claude-sonnet-5", inp=10, out=5, timestamp="2026-07-21T09:00:01Z"),
+        ])
+        codex_repo = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".jsonl", prefix="rollout-", delete=False, encoding="utf-8",
+        )
+        for record in codex_records():
+            codex_repo.write(json.dumps(record) + "\n")
+        codex_repo.close()
+        try:
+            with mock.patch.object(
+                monitoring, "find_all_session_entries",
+                return_value=[
+                    (ts("2026-07-21T09:00:00Z"), claude_alpha.path),
+                    (ts("2026-07-21T09:00:00Z"), claude_beta.path),
+                    (ts("2026-07-20T09:00:00Z"), codex_repo.name),
+                ],
+            ):
+                report = monitoring.build_overall_report(
+                    None, now=monitoring.dt.datetime(2026, 8, 1, tzinfo=monitoring.dt.timezone.utc),
+                )
+
+            self.assertEqual(report.discovered_count, 3)
+            self.assertEqual(report.session_count, 3)
+            self.assertEqual(report.unreadable, 0)
+            self.assertEqual(report.prompt_count, 3)
+
+            self.assertEqual({project.name for project in report.projects}, {"alpha", "beta", "repo"})
+            self.assertEqual(report.projects[0].name, "alpha")  # ranked by weighted consumption
+            self.assertEqual(report.projects[0].sessions, 1)
+            self.assertEqual(len(report.projects[0].recent_sessions), 1)
+            self.assertEqual(report.projects[0].recent_sessions[0].label, "Run review")
+            self.assertEqual(report.projects[0].recent_sessions[0].session_id, "fixture")
+            self.assertGreater(report.projects[0].recent_sessions[0].latest_context, 0)
+            self.assertGreaterEqual(
+                report.projects[0].recent_sessions[0].peak_context,
+                report.projects[0].recent_sessions[0].latest_context,
+            )
+            self.assertEqual(
+                sum(report.projects[0].usage.model_totals.values()), report.projects[0].usage.total,
+            )
+
+            self.assertGreater(report.provider_usage["claude"].total, 0)
+            self.assertGreater(report.provider_usage["codex"].total, 0)
+            self.assertEqual(report.provider_sessions["claude"], 2)
+            self.assertEqual(report.provider_sessions["codex"], 1)
+
+            self.assertIn("claude-sonnet-5", report.total.model_totals)
+            self.assertIn("gpt-5.6-sol", report.total.model_totals)
+            self.assertEqual(sum(report.total.model_totals.values()), report.total.total)
+            self.assertEqual({day.day for day in report.days}, {"2026-07-20", "2026-07-21"})
+            codex_session = next(project for project in report.projects if project.name == "repo").recent_sessions[0]
+            self.assertEqual(codex_session.session_id, "codex-fixture")
+            self.assertTrue(codex_session.rollout_id.startswith("rollout-"))
+            self.assertEqual(codex_session.rollout_count, 1)
+        finally:
+            claude_alpha.close()
+            claude_beta.close()
+            os.unlink(codex_repo.name)
+
+    def test_build_overall_report_counts_unreadable_sessions_without_dropping_totals(self):
+        good = SessionFixture([prompt_with_cwd("/work/good"), assistant_usage()])
+        missing_path = good.path + ".missing"
+        try:
+            with mock.patch.object(
+                monitoring, "find_all_session_entries",
+                return_value=[(time.time(), good.path), (time.time(), missing_path)],
+            ):
+                report = monitoring.build_overall_report(None)
+            self.assertEqual(report.discovered_count, 2)
+            self.assertEqual(report.session_count, 1)
+            self.assertEqual(report.unreadable, 1)
+            self.assertEqual(report.excluded_old, 0)
+            self.assertGreater(report.total.total, 0)
+            self.assertNotIn("older than", "\n".join(monitoring.overall_lines(report, 100)))
+        finally:
+            good.close()
+
+    def test_project_sessions_are_limited_to_last_30_days(self):
+        recent = SessionFixture([
+            prompt_with_cwd("/work/lms", text="Recent session", timestamp="2026-08-20T09:00:00Z"),
+            assistant_usage(inp=100, out=10, timestamp="2026-08-20T09:01:00Z"),
+        ])
+        old = SessionFixture([
+            prompt_with_cwd("/work/lms", text="Old session", timestamp="2026-07-01T09:00:00Z"),
+            assistant_usage(inp=500, out=10, timestamp="2026-07-01T09:01:00Z"),
+        ])
+        try:
+            with mock.patch.object(
+                monitoring, "find_all_session_entries",
+                return_value=[(ts("2026-08-20T09:01:00Z"), recent.path), (ts("2026-07-01T09:01:00Z"), old.path)],
+            ):
+                report = monitoring.build_overall_report(
+                    None, now=monitoring.dt.datetime(2026, 9, 3, tzinfo=monitoring.dt.timezone.utc),
+                )
+            project = report.projects[0]
+            self.assertEqual(project.sessions, 2)
+            self.assertEqual([item.label for item in project.recent_sessions], ["Recent session"])
+            self.assertEqual(project.recent_sessions[0].prompt_count, 1)
+        finally:
+            recent.close()
+            old.close()
+
+    def test_build_overall_report_skips_sessions_older_than_window_without_parsing(self):
+        recent = SessionFixture([
+            prompt_with_cwd("/work/lms", timestamp="2026-08-20T09:00:00Z"),
+            assistant_usage(inp=100, out=10, timestamp="2026-08-20T09:01:00Z"),
+        ])
+        stale = SessionFixture([
+            prompt_with_cwd("/work/lms", timestamp="2026-05-01T09:00:00Z"),
+            assistant_usage(inp=500, out=10, timestamp="2026-05-01T09:01:00Z"),
+        ])
+        now = monitoring.dt.datetime(2026, 9, 3, tzinfo=monitoring.dt.timezone.utc)
+        try:
+            with mock.patch.object(
+                monitoring, "find_all_session_entries",
+                return_value=[(ts("2026-08-20T09:01:00Z"), recent.path), (ts("2026-05-01T09:01:00Z"), stale.path)],
+            ), mock.patch.object(
+                monitoring, "create_analyzer", wraps=monitoring.create_analyzer,
+            ) as analyzer_calls:
+                report = monitoring.build_overall_report(None, now=now)
+                wide = monitoring.build_overall_report(None, window_days=365, now=now)
+            self.assertEqual(report.discovered_count, 2)
+            self.assertEqual(report.session_count, 1)
+            self.assertEqual(report.excluded_old, 1)
+            self.assertEqual(report.total.total, 110)
+            self.assertEqual(
+                [call.args[0] for call in analyzer_calls.call_args_list],
+                [recent.path, recent.path, stale.path],  # 90-day run parsed only `recent`; 365-day run parsed both
+            )
+            lines = "\n".join(monitoring.overall_lines(report, 100))
+            self.assertIn("Sessions active in the last 90 days", lines)
+            self.assertIn("1 older than 90 days, excluded", lines)
+            self.assertIn("older than 90 days", monitoring.render_overall_html(report, "2026-09-03"))
+            self.assertEqual(wide.session_count, 2)
+            self.assertEqual(wide.excluded_old, 0)
+        finally:
+            recent.close()
+            stale.close()
+
+    def test_projects_are_grouped_by_full_cwd_and_same_basenames_are_disambiguated(self):
+        work_tools = SessionFixture([prompt_with_cwd("/Users/me/work/tools"), assistant_usage(inp=300)])
+        lg_tools = SessionFixture([prompt_with_cwd("/Users/me/work/lg/tools"), assistant_usage(inp=100)])
+        other = SessionFixture([prompt_with_cwd("/Users/me/work/flood"), assistant_usage(inp=10)])
+        try:
+            with mock.patch.object(
+                monitoring, "find_all_session_entries",
+                return_value=[(time.time(), path) for path in (work_tools.path, lg_tools.path, other.path)],
+            ):
+                report = monitoring.build_overall_report(None)
+            self.assertEqual(
+                [(project.name, project.root, project.sessions) for project in report.projects],
+                [
+                    ("work/tools", "/Users/me/work/tools", 1),
+                    ("lg/tools", "/Users/me/work/lg/tools", 1),
+                    ("flood", "/Users/me/work/flood", 1),
+                ],
+            )
+            html_text = monitoring.render_overall_html(report, "now")
+            self.assertIn('title="/Users/me/work/lg/tools">lg/tools', html_text)
+        finally:
+            work_tools.close()
+            lg_tools.close()
+            other.close()
+
+    def test_scratchpad_cwd_is_attributed_to_the_owning_sessions_project(self):
+        owner_id = "8e4025bf-d06a-45e3-a7ff-59027338c78d"
+        with tempfile.TemporaryDirectory() as projects_dir:
+            project_dir = Path(projects_dir) / "-Users-me-work-lms"
+            project_dir.mkdir()
+            (project_dir / f"{owner_id}.jsonl").write_text(
+                json.dumps(prompt_with_cwd("/Users/me/work/lms")) + "\n", encoding="utf-8",
+            )
+            scratch_cwd = f"/private/tmp/claude-501/-Users-me-work-lms/{owner_id}/scratchpad"
+            spawned = SessionFixture([prompt_with_cwd(scratch_cwd), assistant_usage(inp=50)])
+            orphan_cwd = "/private/tmp/claude-501/-Users-me-work-gone/00000000-0000-0000-0000-000000000000/scratchpad"
+            orphan = SessionFixture([prompt_with_cwd(orphan_cwd), assistant_usage(inp=5)])
+            try:
+                with mock.patch.object(monitoring, "default_projects_dir", return_value=Path(projects_dir)):
+                    self.assertEqual(monitoring.session_project_root(spawned.path), "/Users/me/work/lms")
+                    # An owner that no longer exists keeps the scratchpad path rather than guessing.
+                    self.assertEqual(monitoring.session_project_root(orphan.path), orphan_cwd)
+            finally:
+                spawned.close()
+                orphan.close()
+
+    def test_daily_trend_buckets_use_the_viewers_timezone(self):
+        late = SessionFixture([
+            prompt_with_cwd("/work/lms", timestamp="2026-07-20T20:30:00Z"),
+            assistant_usage(inp=100, out=10, timestamp="2026-07-20T20:31:00Z"),
+        ])
+        bangkok = monitoring.dt.timezone(monitoring.dt.timedelta(hours=7))
+        now = monitoring.dt.datetime(2026, 8, 1, tzinfo=monitoring.dt.timezone.utc)
+        try:
+            with mock.patch.object(
+                monitoring, "find_all_session_entries", return_value=[(ts("2026-07-20T20:31:00Z"), late.path)],
+            ):
+                local = monitoring.build_overall_report(None, now=now, tz=bangkok)
+                utc = monitoring.build_overall_report(None, now=now, tz=monitoring.dt.timezone.utc)
+            self.assertEqual([day.day for day in local.days], ["2026-07-21"])
+            self.assertEqual([day.day for day in utc.days], ["2026-07-20"])
+            self.assertTrue(local.projects[0].recent_sessions[0].timestamp.startswith("2026-07-21T03:30"))
+        finally:
+            late.close()
+
+    def test_codex_rollout_shards_are_one_session_and_their_usage_is_combined(self):
+        thread_id = "01a06201-c11e-7430-9dc1-57700eb22393"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            first = Path(tmp_dir) / f"rollout-2026-07-20T10-00-00-{thread_id}.jsonl"
+            current = Path(tmp_dir) / (
+                f"rollout-2026-07-20T11-00-00-{thread_id}_"
+                "01a0624a-fb7e-7531-a77e-de8c2abc4417.jsonl"
+            )
+            for path in (first, current):
+                records = codex_records()
+                records[0]["payload"]["id"] = thread_id
+                records[0]["payload"]["session_id"] = thread_id
+                path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+            one_shard_total = monitoring.create_analyzer(str(first)).analysis.total_usage.total
+            with mock.patch.object(
+                monitoring, "find_all_session_entries", return_value=[(ts("2026-07-20T11:00:00Z"), str(current))],
+            ):
+                report = monitoring.build_overall_report(
+                    None, now=monitoring.dt.datetime(2026, 8, 1, tzinfo=monitoring.dt.timezone.utc),
+                )
+
+            self.assertEqual(report.session_count, 1)
+            self.assertEqual(report.provider_sessions["codex"], 1)
+            self.assertEqual(report.prompt_count, 2)
+            self.assertEqual(report.total.total, one_shard_total * 2)
+            session = report.projects[0].recent_sessions[0]
+            self.assertEqual(session.session_id, thread_id)
+            self.assertEqual(session.rollout_id, current.stem)
+            self.assertEqual(session.rollout_count, 2)
+            html_text = monitoring.render_overall_html(report, "2026-08-01 00:00:00")
+            display_id = (
+                "rollout-2026-07-20T11-00-00-01a06201-c11e-7430-9dc1_"
+                "01a0624a-fb7e-7531-a77e"
+            )
+            self.assertIn(display_id, html_text)
+            self.assertIn(f"thread {thread_id}", html_text)
+            self.assertIn(f"full rollout {current.stem}", html_text)
+            self.assertIn("2 shard(s)", html_text)
+
+    def test_codex_rollout_display_id_strips_each_uuid_tail(self):
+        root = "rollout-2026-09-03T16-30-06-01a0669a-a7a5-71f1-8431-59a6fa3c6ce0"
+        shard = (
+            "rollout-2026-09-02T20-24-36-01a06201-c11e-7430-9dc1-57700eb22393_"
+            "01a0624a-fb7e-7531-a77e-de8c2abc4417"
+        )
+
+        self.assertEqual(
+            monitoring.display_rollout_id(root),
+            "rollout-2026-09-03T16-30-06-01a0669a-a7a5-71f1-8431",
+        )
+        self.assertEqual(
+            monitoring.display_rollout_id(shard),
+            "rollout-2026-09-02T20-24-36-01a06201-c11e-7430-9dc1_"
+            "01a0624a-fb7e-7531-a77e",
+        )
+
+    def test_overall_lines_are_shallow_and_mark_unmeasured_sections(self):
+        empty_report = monitoring.OverallReport(
+            total=monitoring.Usage(),
+            projects=[],
+            provider_usage={"claude": monitoring.Usage(), "codex": monitoring.Usage()},
+            provider_sessions=monitoring.Counter(),
+            session_count=0, discovered_count=0, prompt_count=0, unreadable=0, days=[],
+        )
+        lines = monitoring.overall_lines(empty_report, 100)
+        self.assertLess(len(lines), 40)  # one shallow screen, not a drill-down view
+        for section in monitoring.OVERALL_SECTIONS:
+            self.assertIn(section, lines)
+        joined = "\n".join(lines)
+        self.assertIn("Not measured", joined)
+        self.assertNotIn("$", joined)  # never invents pricing
+
+    def test_o_opens_overall_and_p_exports_html_while_p_still_opens_processes_elsewhere(self):
+        fixture = SessionFixture([prompt_with_cwd("/work/fixture"), assistant_usage()])
+
+        class Screen:
+            def getmaxyx(self):
+                return 30, 100
+
+        try:
+            with mock.patch.object(monitoring, "find_all_session_entries", return_value=[(time.time(), fixture.path)]):
+                app = monitoring.TTYApp(Screen(), fixture.path)
+                app.refresh(force=True)
+
+                app.handle_key(ord("p"))
+                self.assertEqual(app.mode, "processes")
+                app.handle_key(ord("p"))
+                self.assertEqual(app.mode, "list")
+
+                app.handle_key(ord("o"))
+                self.assertEqual(app.mode, "overall")
+                app.overall_thread.join(timeout=2)
+                self.assertFalse(app.overall_thread.is_alive())
+                self.assertIsNotNone(app.overall_report)
+
+                with (
+                    mock.patch.object(monitoring, "write_overall_report", return_value=(True, "saved /tmp/x.html")) as write,
+                    mock.patch.object(monitoring, "open_overall_report", return_value=(True, "opened in browser · /tmp/x.html")) as open_report,
+                ):
+                    app.handle_key(ord("p"))
+                    write.assert_called_once_with(app.overall_report)
+                    open_report.assert_called_once_with()
+                self.assertEqual(app.transient_status, "saved /tmp/x.html")
+                self.assertIn("saved /tmp/x.html", app.frame()[-1][0])
+                self.assertEqual(app.mode, "overall")
+
+                app.handle_key(monitoring.curses.KEY_RIGHT)
+                self.assertEqual(app.mode, "project")
+                self.assertEqual(app.selected_project, "/work/fixture")
+                project_page = "\n".join(row for row, _ in app.frame())
+                self.assertIn("Model mix", project_page)
+                self.assertIn("Top 5 sessions by consumption · last 30 days", project_page)
+                self.assertIn("Top 5 files", project_page)
+                app.handle_key(monitoring.curses.KEY_LEFT)
+                self.assertEqual(app.mode, "overall")
+
+                with (
+                    mock.patch.object(monitoring, "write_overall_report", return_value=(True, "saved again")) as write,
+                    mock.patch.object(monitoring, "open_overall_report", return_value=(True, "opened again")),
+                ):
+                    app.handle_key(ord("P"))
+                    write.assert_called_once_with(app.overall_report)
+
+                app.handle_key(monitoring.curses.KEY_LEFT)
+                self.assertEqual(app.mode, "list")
+        finally:
+            fixture.close()
+
+    def test_o_shows_loading_progress_without_blocking_the_tui(self):
+        fixture = SessionFixture([prompt_with_cwd("/work/fixture"), assistant_usage()])
+        started = threading.Event()
+        release = threading.Event()
+
+        class Screen:
+            def getmaxyx(self):
+                return 24, 100
+
+        def slow_report(cache, window_days=monitoring.OVERALL_WINDOW_DAYS, progress=None):
+            if progress:
+                progress(7, 20)
+            started.set()
+            release.wait(timeout=2)
+            return monitoring.OverallReport(
+                total=monitoring.Usage(), projects=[],
+                provider_usage={"claude": monitoring.Usage(), "codex": monitoring.Usage()},
+                provider_sessions=monitoring.Counter(), session_count=0, discovered_count=0,
+                prompt_count=0, unreadable=0, days=[],
+            )
+
+        try:
+            app = monitoring.TTYApp(Screen(), fixture.path)
+            with mock.patch.object(monitoring, "build_overall_report", side_effect=slow_report):
+                app.handle_key(ord("o"))
+                self.assertTrue(started.wait(timeout=1))
+                self.assertEqual(app.overall_load_state, "loading")
+                rendered = "\n".join(row for row, _ in app.frame())
+                self.assertIn("Processing overall", app.frame()[-1][0])
+                self.assertIn("7/20", rendered)
+                self.assertNotIn("Reading Claude and Codex", rendered)
+                app.handle_key(monitoring.curses.KEY_LEFT)
+                self.assertEqual(app.mode, "list")
+                self.assertIn("Processing overall", app.frame()[-1][0])
+                release.set()
+                app.overall_thread.join(timeout=2)
+            self.assertEqual(app.overall_load_state, "ready")
+        finally:
+            release.set()
+            fixture.close()
+
+    def test_bottom_right_status_expires_after_ten_seconds(self):
+        fixture = SessionFixture([prompt(), assistant_usage()])
+
+        class Screen:
+            def getmaxyx(self):
+                return 24, 100
+
+        try:
+            app = monitoring.TTYApp(Screen(), fixture.path)
+            with mock.patch.object(monitoring.time, "monotonic", return_value=100.0):
+                app.set_status_area("saved /tmp/overall-report.html")
+            with mock.patch.object(monitoring.time, "monotonic", return_value=109.9):
+                self.assertEqual(app.status_area(), "saved /tmp/overall-report.html")
+            with mock.patch.object(monitoring.time, "monotonic", return_value=110.0):
+                self.assertEqual(app.status_area(), "")
+        finally:
+            fixture.close()
+
+    def test_project_detail_ranks_models_recent_sessions_and_files_by_consumption(self):
+        project = monitoring.ProjectUsage("lms", sessions=3, prompts=3)
+        for label, model, tokens in (
+            ("Implement enrollment", "claude-sonnet-5", 100),
+            ("Fix report", "gpt-5.6-sol", 60),
+            ("Review tests", "claude-sonnet-5", 20),
+        ):
+            usage = monitoring.Usage()
+            usage.add(model, tokens - 5, 5, 0, 0)
+            project.usage.merge(usage)
+            project.recent_sessions.append(monitoring.SessionUsage(
+                f"session-{model}", "", 1, label, "2026-09-03T10:00:00Z", "claude", usage,
+                2, tokens // 2, tokens // 2 + 10, 80.0,
+            ))
+        project.files.update({"src/enrollment.py": 7, "tests/test_report.py": 3})
+
+        lines = monitoring.project_detail_lines(project, 100)
+        joined = "\n".join(lines)
+        self.assertIn("sonnet-5", joined)
+        self.assertIn("66.7%", joined)
+        self.assertLess(joined.index("Implement enrollment"), joined.index("Fix report"))
+        self.assertIn("src/enrollment.py · 7 operations", joined)
+        self.assertIn("not consumption attribution", joined)
+        self.assertIn("session session-claude-sonnet", joined)
+        self.assertIn("ctx 50 latest / 60 peak · 80% cached overall", joined)
+
+    def test_project_session_tokens_are_flush_right_with_thai_text(self):
+        project = monitoring.ProjectUsage("lms", sessions=1, prompts=1)
+        usage = monitoring.Usage()
+        usage.add("opus-5", 300_000_000, 5_730_000, 0, 0)
+        project.usage.merge(usage)
+        project.recent_sessions.append(monitoring.SessionUsage(
+            "72bdfdd0-6f98-485b-aee6-c8005ccc1fd7", "", 1,
+            "ถ้าตอนนี้เราให้นายแก้ FE DS เพื่อ implement บน BO นายจะทำยังไงอะ",
+            "2026-08-17T00:00:00Z", "claude", usage, 45, 272_200, 751_800, 100.0,
+        ))
+
+        task_line = next(
+            line for line in monitoring.project_detail_lines(project, 200)
+            if line.startswith("1. ")
+        )
+
+        self.assertTrue(task_line.endswith("305.73M"))
+        self.assertEqual(
+            monitoring.terminal_width(task_line), monitoring.PROJECT_DETAIL_CONTENT_WIDTH,
+        )
+        self.assertEqual(monitoring.truncate_terminal_layout(task_line, 120), task_line)
+
+    def test_project_session_metadata_row_jumps_to_that_session(self):
+        current = SessionFixture([prompt("Current"), assistant_usage()])
+        target = SessionFixture([prompt("Target"), assistant_usage()])
+
+        class Screen:
+            def getmaxyx(self):
+                return 24, 120
+
+        try:
+            app = monitoring.TTYApp(Screen(), current.path)
+            usage = monitoring.create_analyzer(target.path).analysis.total_usage
+            project = monitoring.ProjectUsage("lms", usage=usage, sessions=1, prompts=1, root="/work/lms")
+            project.recent_sessions.append(monitoring.SessionUsage(
+                "fixture", "", 1, "Target", "2026-09-03T00:00:00Z", "claude",
+                usage, 1, 10, 10, 0.0, target.path,
+            ))
+            app.overall_report = monitoring.OverallReport(
+                total=usage, projects=[project], provider_usage={"claude": usage},
+                provider_sessions=monitoring.Counter(claude=1), session_count=1,
+                discovered_count=1, prompt_count=1, unreadable=0, days=[],
+            )
+            app.selected_project = "/work/lms"
+            app.mode = "project"
+
+            rendered = app.frame()
+            self.assertTrue(any("session fixture" in line and attr & monitoring.curses.A_REVERSE
+                                for line, attr in rendered))
+            with mock.patch.object(monitoring, "find_all_sessions", return_value=[target.path, current.path]):
+                app.handle_key(monitoring.curses.KEY_ENTER)
+
+            self.assertEqual(app.path, target.path)
+            self.assertEqual(app.mode, "list")
+            app.handle_key(monitoring.curses.KEY_LEFT)
+            self.assertEqual(app.path, current.path)
+            self.assertEqual(app.mode, "project")
+        finally:
+            current.close()
+            target.close()
+
+    def test_search_accepts_thai_and_hash_session_id_opens_detail(self):
+        session_id = "72bdfdd0-6f98-485b-aee6-c8005ccc1fd7"
+        record = prompt("แก้หน้ารายงานภาษาไทย")
+        record["sessionId"] = session_id
+        fixture = SessionFixture([record, assistant_usage()])
+
+        class Screen:
+            def getmaxyx(self):
+                return 24, 120
+
+        try:
+            app = monitoring.TTYApp(Screen(), fixture.path)
+            app.refresh(force=True)
+            app.handle_key(ord("/"))
+            for char in "ภาษาไทย":
+                app.handle_key(char)
+            self.assertEqual(app.search_query, "ภาษาไทย")
+            app.handle_key("\n")
+            self.assertEqual(app.mode, "list")
+            self.assertTrue(app.search_matches)
+
+            app.handle_key(ord("/"))
+            for char in f"#{session_id}":
+                app.handle_key(char)
+            with mock.patch.object(monitoring, "find_all_sessions", return_value=[fixture.path]):
+                app.handle_key("\n")
+
+            self.assertEqual(app.path, fixture.path)
+            self.assertEqual(app.mode, "detail")
+            self.assertEqual(app.selected_prompt, 1)
+            app.handle_key(27)
+            self.assertEqual(app.path, fixture.path)
+            self.assertEqual(app.mode, "list")
+        finally:
+            fixture.close()
+
+    def test_render_overall_html_is_self_contained_and_escapes_untrusted_text(self):
+        report = monitoring.OverallReport(
+            total=monitoring.Usage(),
+            projects=[monitoring.ProjectUsage(name="<script>alert(1)</script>", sessions=1, prompts=1)],
+            provider_usage={"claude": monitoring.Usage(), "codex": monitoring.Usage()},
+            provider_sessions=monitoring.Counter(claude=1),
+            session_count=1, discovered_count=1, prompt_count=1, unreadable=0, days=[],
+        )
+        report.projects[0].usage.add("<img src=x onerror=alert(1)>", 10, 5, 0, 0)
+        report.projects[0].recent_sessions.append(monitoring.SessionUsage(
+            "<unsafe-id>", "", 1, "<b>unsafe session</b>", "2026-09-03T00:00:00Z", "claude",
+            report.projects[0].usage, 1, 10, 15, 50.0,
+        ))
+        report.projects[0].files["<svg onload=alert(1)>"] = 2
+        report.total.merge(report.projects[0].usage)
+        report.provider_usage["claude"].merge(report.projects[0].usage)
+
+        html_text = monitoring.render_overall_html(report, "2026-09-03 00:00:00")
+
+        self.assertTrue(html_text.strip().startswith("<!doctype html>"))
+        self.assertNotIn("<script>alert", html_text)
+        self.assertNotIn("<img src=x", html_text)
+        self.assertNotIn("<b>unsafe session", html_text)
+        self.assertNotIn("<unsafe-id>", html_text)
+        self.assertNotIn("<svg onload", html_text)
+        self.assertIn("&lt;script&gt;", html_text)
+        self.assertIn("<h2>Projects</h2>", html_text)
+        self.assertEqual(html_text.count("<h2>Projects</h2>"), 1)
+        self.assertNotIn("<h2>Top projects</h2>", html_text)
+        self.assertIn("Top 5 sessions by consumption · last 30 days", html_text)
+        self.assertIn("Consumption score", html_text)
+        self.assertNotIn("Total tokens", html_text)
+        self.assertIn("Fresh ×1", html_text)
+        self.assertIn("Cache ×0.1", html_text)
+        self.assertIn('class="session-main"', html_text)
+        self.assertIn('class="session-meta"', html_text)
+        self.assertNotIn("<th>Session / rollout ID</th>", html_text)
+        self.assertIn("latest", html_text)
+        self.assertIn("peak", html_text)
+        self.assertIn(".bar-fill { display: block;", html_text)
+        self.assertNotIn("http://", html_text)
+        self.assertNotIn("https://", html_text)
+        self.assertNotIn("src=\"", html_text)
+        self.assertNotIn("href=", html_text)
+
+    def test_write_overall_report_reports_saved_path_and_surfaces_failures(self):
+        report = monitoring.OverallReport(
+            total=monitoring.Usage(),
+            projects=[],
+            provider_usage={"claude": monitoring.Usage(), "codex": monitoring.Usage()},
+            provider_sessions=monitoring.Counter(),
+            session_count=0, discovered_count=0, prompt_count=0, unreadable=0, days=[],
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            target = Path(tmp_dir) / "nested" / "overall-report.html"
+            with mock.patch.object(monitoring, "default_overall_report_path", return_value=target):
+                ok, message = monitoring.write_overall_report(report)
+            self.assertTrue(ok)
+            self.assertIn(str(target), message)
+            self.assertTrue(target.is_file())
+            self.assertIn("<!doctype html>", target.read_text())
+
+        with (
+            mock.patch.object(monitoring, "default_overall_report_path", return_value=Path("/no/such/dir/report.html")),
+            mock.patch.object(Path, "mkdir", side_effect=OSError("denied")),
+        ):
+            ok, message = monitoring.write_overall_report(report)
+        self.assertFalse(ok)
+        self.assertTrue(message.startswith("export failed"))
 
 
 if __name__ == "__main__":
