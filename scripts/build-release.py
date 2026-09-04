@@ -12,6 +12,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 FILES = (
     "README.md",
+    "docs/codex-session-storage.md",
+    "docs/consumption-score.md",
     "monitoring.py",
     "tools/codex_telemetry.py",
     "scripts/install.sh",
