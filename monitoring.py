@@ -54,6 +54,7 @@ import unicodedata
 
 from collections import Counter
 from dataclasses import dataclass, field, fields, is_dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 
@@ -2728,9 +2729,24 @@ OVERALL_HTML_MAX_MODELS = 30
 OVERALL_HTML_MAX_TREND_DAYS = 90
 
 
-def render_overall_html(report: OverallReport, generated_at: str) -> str:
-    """Render a single, offline, self-contained HTML usage report — inline CSS, no JS or external assets."""
+def render_overall_html(report: OverallReport, generated_at: str, live: dict[str, Any] | None = None) -> str:
+    """Render a single, offline, self-contained HTML usage report — inline CSS, no external assets.
+
+    The exported file carries no script at all. When ``live`` is given (the ``d`` dashboard),
+    one inline script polls the serving loopback server's ``/api/status`` and reloads the page
+    once a newer report has been built; it still talks to nothing but that server.
+    """
     esc = html.escape
+    footer_note = "offline, self-contained report · no external assets or network requests"
+    live_script = ""
+    if live:
+        footer_note = (
+            f"live dashboard on {DASHBOARD_HOST} · report rebuilt every {live['refresh_seconds']:g}s"
+            f" · generated {esc(generated_at)}"
+        )
+        live_script = LIVE_DASHBOARD_SCRIPT.format(
+            version=int(live["version"]), poll_ms=int(live["poll_seconds"] * 1000),
+        )
     total = report.total
 
     def bar_row(label: str, value: float, whole: float, color: str, sub: str = "") -> str:
@@ -3016,9 +3032,9 @@ def render_overall_html(report: OverallReport, generated_at: str) -> str:
     counted separately in the scope line.
   </div>
 
-  <footer>agent-monitor · offline, self-contained report · no external assets or network requests</footer>
+  <footer>agent-monitor · {footer_note}</footer>
 </main>
-</body>
+{live_script}</body>
 </html>
 """
 
@@ -3034,19 +3050,194 @@ def write_overall_report(report: OverallReport) -> tuple[bool, str]:
     return True, f"saved {path}"
 
 
-def open_overall_report(path: Path | None = None) -> tuple[bool, str]:
-    """Open an exported report without blocking the curses event loop."""
-    target = path or default_overall_report_path()
+def open_in_browser(target: str) -> tuple[bool, str]:
+    """Hand a file path or URL to the default browser without blocking the curses event loop.
+
+    Returns ``(ok, reason)``; ``reason`` is empty when the browser was actually asked to open it.
+    """
     if os.environ.get("AGENT_MONITOR_NO_BROWSER"):
-        return True, f"saved {target} · browser opening disabled"
+        return True, "browser opening disabled"
     try:
         subprocess.Popen(
-            ("open", str(target)), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ("open", target), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
     except OSError as exc:
-        return False, f"saved {target} · could not open browser: {exc}"
+        return False, f"could not open browser: {exc}"
+    return True, ""
+
+
+def open_overall_report(path: Path | None = None) -> tuple[bool, str]:
+    """Open an exported report without blocking the curses event loop."""
+    target = path or default_overall_report_path()
+    opened, reason = open_in_browser(str(target))
+    if reason:
+        return opened, f"saved {target} · {reason}"
     return True, f"opened in browser · {target}"
+
+
+DASHBOARD_HOST = "127.0.0.1"
+DASHBOARD_POLL_SECONDS = 5.0
+LIVE_DASHBOARD_SCRIPT = """<script>
+(function () {{
+  var version = {version};
+  function poll() {{
+    fetch("/api/status", {{cache: "no-store"}})
+      .then(function (response) {{ return response.json(); }})
+      .then(function (status) {{ if (status.version !== version) {{ location.reload(); }} }})
+      .catch(function () {{}});
+  }}
+  setInterval(poll, {poll_ms});
+}})();
+</script>
+"""
+
+
+def dashboard_refresh_seconds() -> float:
+    return max(5.0, configured_weight("AGENT_MONITOR_DASHBOARD_REFRESH", 60.0))
+
+
+class OverallDashboardServer:
+    """Serve the Overall report on loopback and keep rebuilding it in the background.
+
+    The page is the same self-contained HTML that ``p`` exports, plus one inline script that
+    polls ``/api/status`` and reloads once a newer report exists. Nothing leaves the host: the
+    socket binds 127.0.0.1 only, the page requests nothing but that socket, and the report
+    itself is rebuilt with the same ``build_overall_report`` the TUI trusts, so the dashboard
+    never grows a second accounting.
+    """
+    def __init__(
+        self, cache_path: str | None, initial: OverallReport | None = None,
+        refresh_seconds: float | None = None,
+        build: Callable[[ProfilerCache | None], OverallReport] | None = None,
+    ) -> None:
+        self.cache_path = cache_path
+        self.refresh_seconds = refresh_seconds if refresh_seconds is not None else dashboard_refresh_seconds()
+        self.build = build or build_overall_report
+        self.lock = threading.Lock()
+        self.version = 0
+        self.generated_at = ""
+        self.html = ""
+        self.session_count = 0
+        self.refreshing = False
+        self.error = ""
+        self.stop_event = threading.Event()
+        self.server: ThreadingHTTPServer | None = None
+        self.threads: list[threading.Thread] = []
+        if initial is not None:
+            self.publish(initial)
+        else:
+            self.html = self._placeholder_html()
+
+    @property
+    def url(self) -> str:
+        if self.server is None:
+            return ""
+        return f"http://{DASHBOARD_HOST}:{self.server.server_address[1]}/"
+
+    @property
+    def running(self) -> bool:
+        return self.server is not None and not self.stop_event.is_set()
+
+    def _placeholder_html(self) -> str:
+        script = LIVE_DASHBOARD_SCRIPT.format(version=self.version, poll_ms=int(DASHBOARD_POLL_SECONDS * 1000))
+        return (
+            "<!doctype html><html><head><meta charset=\"utf-8\"><title>agent-monitor · overall</title></head>"
+            "<body><p>Building the Overall report… this page reloads when it is ready.</p>"
+            f"{script}</body></html>"
+        )
+
+    def publish(self, report: OverallReport) -> int:
+        generated_at = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        with self.lock:
+            self.version += 1
+            self.generated_at = generated_at
+            self.session_count = report.session_count
+            self.html = render_overall_html(report, generated_at, live={
+                "version": self.version, "refresh_seconds": self.refresh_seconds,
+                "poll_seconds": DASHBOARD_POLL_SECONDS,
+            })
+            return self.version
+
+    def status(self) -> dict[str, Any]:
+        with self.lock:
+            return {
+                "version": self.version, "generated_at": self.generated_at,
+                "sessions": self.session_count, "refreshing": self.refreshing,
+                "refresh_seconds": self.refresh_seconds, "error": self.error,
+            }
+
+    def rebuild(self) -> bool:
+        self.refreshing = True
+        background: ProfilerCache | None = None
+        try:
+            if self.cache_path:
+                background = ProfilerCache(self.cache_path)
+            report = self.build(background)
+        except Exception as exc:  # keep the previous report on screen; surface the failure in /api/status
+            self.error = str(exc)
+            return False
+        finally:
+            if background is not None:
+                background.db.close()
+            self.refreshing = False
+        self.error = ""
+        self.publish(report)
+        return True
+
+    def _refresh_loop(self) -> None:
+        if self.version == 0 and not self.stop_event.is_set():
+            self.rebuild()
+        while not self.stop_event.wait(self.refresh_seconds):
+            self.rebuild()
+
+    def _handler_class(self) -> type[BaseHTTPRequestHandler]:
+        dashboard = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_: Any) -> None:
+                pass  # curses owns the terminal; never write request logs to it
+
+            def do_GET(self) -> None:
+                route = self.path.split("?", 1)[0]
+                if route in ("/", "/index.html"):
+                    with dashboard.lock:
+                        body = dashboard.html.encode("utf-8")
+                    content_type = "text/html; charset=utf-8"
+                elif route == "/api/status":
+                    body = json.dumps(dashboard.status()).encode("utf-8")
+                    content_type = "application/json"
+                else:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+
+        return Handler
+
+    def start(self) -> str:
+        self.server = ThreadingHTTPServer((DASHBOARD_HOST, 0), self._handler_class())
+        self.server.daemon_threads = True
+        self.threads = [
+            threading.Thread(target=self.server.serve_forever, name="agent-monitor-dashboard", daemon=True),
+            threading.Thread(target=self._refresh_loop, name="agent-monitor-dashboard-refresh", daemon=True),
+        ]
+        for thread in self.threads:
+            thread.start()
+        return self.url
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.server is not None:
+            self.server.shutdown()
+            self.server.server_close()
+        # The refresh thread may be mid-build; it is a daemon and checks the stop flag afterwards.
+        if self.threads:
+            self.threads[0].join(timeout=2.0)
 
 
 def request_detail_lines(request: RequestInfo, index: int, width: int) -> list[str]:
@@ -3390,6 +3581,7 @@ class TTYApp:
         self.overall_load_total = 0
         self.overall_load_error = ""
         self.overall_thread: threading.Thread | None = None
+        self.dashboard: OverallDashboardServer | None = None
         self.overall_project_cursor = 0
         self.project_session_cursor = 0
         self.selected_project = ""
@@ -3795,6 +3987,36 @@ class TTYApp:
         opened, open_message = open_overall_report()
         self.set_status_area(message if opened else f"{message} · {open_message}")
 
+    def toggle_dashboard(self) -> None:
+        if self.dashboard is not None:
+            self.dashboard.stop()
+            self.dashboard = None
+            self.set_status_area("Dashboard stopped")
+            return
+        if self.overall_load_state == "loading":
+            done, total = self.overall_load_progress, self.overall_load_total
+            progress = f" ({done}/{total})" if total else ""
+            self.set_status_area(f"Overall is still processing{progress}")
+            return
+        if self.overall_report is None:
+            self.set_status_area("Report unavailable · press r to retry")
+            return
+        server = OverallDashboardServer(str(self.cache.path) if self.cache else None, initial=self.overall_report)
+        try:
+            url = server.start()
+        except OSError as exc:
+            self.set_status_area(f"dashboard failed: {exc}")
+            return
+        self.dashboard = server
+        opened, reason = open_in_browser(url)
+        suffix = f" · {reason}" if reason else ""
+        self.set_status_area(f"live at {url} · d to stop{suffix}", duration=0 if opened else 10.0)
+
+    def stop_dashboard(self) -> None:
+        if self.dashboard is not None:
+            self.dashboard.stop()
+            self.dashboard = None
+
     def handle_key(self, key: int | str) -> bool:
         text_key = key if isinstance(key, str) else ""
         if isinstance(key, str):
@@ -3871,6 +4093,8 @@ class TTYApp:
                 return False
             if key in (ord("p"), ord("P")):
                 self.export_overall_report()
+            elif key in (ord("d"), ord("D")):
+                self.toggle_dashboard()
             elif key in (27, curses.KEY_LEFT, ord("o"), ord("O")):
                 self.mode = "list"
             elif key == curses.KEY_DOWN:
@@ -3904,6 +4128,8 @@ class TTYApp:
                 self.mode = "overall"
             elif key in (ord("p"), ord("P")):
                 self.export_overall_report()
+            elif key in (ord("d"), ord("D")):
+                self.toggle_dashboard()
             elif key == curses.KEY_DOWN:
                 project = self.selected_project_usage()
                 sessions = sorted(
@@ -4142,9 +4368,11 @@ class TTYApp:
                     prefix = "> " if selected else "  "
                     rows.append((prefix + truncate_layout(line, width - len(prefix) - 1), attr))
             export_action = "p/P export + open" if self.overall_load_state == "ready" else "p/P after loading"
+            dashboard_action = "d stop live" if self.dashboard is not None else "d live dashboard"
             footer = fit_action_bar(
-                f" OVERALL │ ↑/↓ project │ → open │ PgUp/PgDn scroll │ {export_action} │ r refresh │ ← back │ q quit",
-                f" OVERALL │ ↑/↓ project │ → open │ {export_action} │ ← back",
+                f" OVERALL │ ↑/↓ project │ → open │ PgUp/PgDn scroll │ {export_action} │ {dashboard_action}"
+                " │ r refresh │ ← back │ q quit",
+                f" OVERALL │ ↑/↓ project │ → open │ {export_action} │ d live │ ← back",
                 width,
             )
         elif self.mode == "project":
@@ -4175,8 +4403,9 @@ class TTYApp:
                 )
                 rows.append((("> " if selected else "  ") + truncate_terminal_layout(line, width - 3), attr))
             footer = fit_action_bar(
-                " PROJECT │ ↑/↓ session │ → jump │ / search or #id │ PgUp/PgDn scroll │ p/P export + open │ ← overall │ q quit",
-                " PROJECT │ ↑/↓ session │ → jump │ / search │ p export │ ← overall",
+                " PROJECT │ ↑/↓ session │ → jump │ / search or #id │ PgUp/PgDn scroll │ p/P export + open"
+                " │ d live dashboard │ ← overall │ q quit",
+                " PROJECT │ ↑/↓ session │ → jump │ / search │ p export │ d live │ ← overall",
                 width,
             )
         elif self.mode == "detail":
@@ -4371,15 +4600,18 @@ class TTYApp:
         self.screen.timeout(100)
         self.screen.keypad(True)
         self.refresh(force=True)
-        while True:
-            self.refresh()
-            self.draw()
-            try:
-                key = self.screen.get_wch()
-            except curses.error:
-                continue
-            if not self.handle_key(key):
-                break
+        try:
+            while True:
+                self.refresh()
+                self.draw()
+                try:
+                    key = self.screen.get_wch()
+                except curses.error:
+                    continue
+                if not self.handle_key(key):
+                    break
+        finally:
+            self.stop_dashboard()
 
 
 def print_session_list(limit: int) -> None:

@@ -2034,3 +2034,117 @@ class CodexTokenCountDedupTests(unittest.TestCase):
         finally:
             os.unlink(path)
             os.unlink(cache_file.name)
+
+
+def small_overall_report(session_count=1):
+    usage = monitoring.Usage()
+    usage.add("claude-fable", 10, 5, 0, 100)
+    project = monitoring.ProjectUsage("tools", usage=usage, sessions=session_count, prompts=1, root="/work/tools")
+    return monitoring.OverallReport(
+        total=usage, projects=[project], provider_usage={"claude": usage},
+        provider_sessions=monitoring.Counter(claude=session_count), session_count=session_count,
+        discovered_count=session_count, prompt_count=1, unreadable=0, days=[],
+    )
+
+
+class LiveDashboardTests(unittest.TestCase):
+    def test_exported_report_stays_script_free_and_live_page_only_talks_to_itself(self):
+        exported = monitoring.render_overall_html(small_overall_report(), "now")
+        self.assertNotIn("<script", exported)
+        live = monitoring.render_overall_html(
+            small_overall_report(), "now", live={"version": 3, "refresh_seconds": 60, "poll_seconds": 5},
+        )
+        self.assertIn("var version = 3;", live)
+        self.assertIn('fetch("/api/status"', live)
+        self.assertIn("live dashboard on 127.0.0.1", live)
+        self.assertNotIn("https://", live)
+        self.assertNotIn("http://", live)
+
+    def test_dashboard_serves_report_and_bumps_version_after_rebuild(self):
+        import urllib.error
+        import urllib.request
+
+        rebuilt = small_overall_report(session_count=7)
+        server = monitoring.OverallDashboardServer(
+            None, initial=small_overall_report(), refresh_seconds=3600, build=lambda cache: rebuilt,
+        )
+        url = server.start()
+        try:
+            self.assertTrue(url.startswith("http://127.0.0.1:"))
+            self.assertTrue(server.running)
+            with urllib.request.urlopen(url) as response:
+                page = response.read().decode("utf-8")
+                self.assertEqual(response.headers["Cache-Control"], "no-store")
+            self.assertIn("var version = 1;", page)
+            with urllib.request.urlopen(url + "api/status") as response:
+                status = json.loads(response.read())
+            self.assertEqual(status["version"], 1)
+            self.assertEqual(status["sessions"], 1)
+            self.assertFalse(status["refreshing"])
+
+            self.assertTrue(server.rebuild())
+            with urllib.request.urlopen(url + "api/status") as response:
+                status = json.loads(response.read())
+            self.assertEqual(status["version"], 2)
+            self.assertEqual(status["sessions"], 7)
+            with urllib.request.urlopen(url) as response:
+                self.assertIn("var version = 2;", response.read().decode("utf-8"))
+
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(url + "nope")
+            self.assertEqual(caught.exception.code, 404)
+        finally:
+            server.stop()
+        self.assertFalse(server.running)
+        with self.assertRaises(urllib.error.URLError):
+            urllib.request.urlopen(url, timeout=1)
+
+    def test_failed_rebuild_keeps_previous_report_and_reports_error(self):
+        def explode(cache):
+            raise RuntimeError("disk on fire")
+
+        server = monitoring.OverallDashboardServer(None, initial=small_overall_report(), refresh_seconds=3600, build=explode)
+        self.assertFalse(server.rebuild())
+        status = server.status()
+        self.assertEqual(status["version"], 1)
+        self.assertEqual(status["error"], "disk on fire")
+        self.assertIn("Consumption score", server.html)
+
+    def test_d_toggles_dashboard_from_overall_and_run_exit_stops_it(self):
+        fixture = SessionFixture([prompt(), assistant_usage()])
+
+        class Screen:
+            def getmaxyx(self):
+                return 24, 120
+
+        try:
+            with mock.patch.dict(os.environ, {"AGENT_MONITOR_NO_BROWSER": "1"}):
+                app = monitoring.TTYApp(Screen(), fixture.path)
+                app.mode = "overall"
+                app.overall_load_state = "loading"
+                app.handle_key(ord("d"))
+                self.assertIsNone(app.dashboard)
+                self.assertIn("still processing", app.transient_status)
+
+                app.overall_load_state = "ready"
+                app.overall_report = small_overall_report()
+                app.handle_key(ord("d"))
+                self.assertIsNotNone(app.dashboard)
+                self.assertTrue(app.dashboard.running)
+                self.assertIn(app.dashboard.url, app.transient_status)
+                self.assertIn("browser opening disabled", app.transient_status)
+                self.assertTrue(any("d stop live" in line for line, _ in app.frame()))
+
+                server = app.dashboard
+                app.handle_key(ord("D"))
+                self.assertIsNone(app.dashboard)
+                self.assertFalse(server.running)
+                self.assertEqual(app.transient_status, "Dashboard stopped")
+
+                app.handle_key(ord("d"))
+                server = app.dashboard
+                self.assertTrue(server.running)
+                app.stop_dashboard()
+                self.assertFalse(server.running)
+        finally:
+            fixture.close()

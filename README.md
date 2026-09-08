@@ -63,6 +63,8 @@ Search input uses the terminal's Unicode-aware character API, so `/` accepts Tha
 
 On the Overall page only, `p` (or `P`) exports the same report as a single, self-contained offline HTML file — inline CSS, no external assets or network requests — to `~/Library/Caches/execution-profiler/overall-report.html`, opens it in the default browser, and shows the saved path in the bottom-right status area for 10 seconds. The project ranking itself is expandable in HTML, so model/session/file details live in one list rather than a duplicated second section. Everywhere else, `p` keeps its normal meaning: background processes for the selected prompt/session.
 
+`d` (or `D`) on the Overall or project page starts a live dashboard: the same report page served from a local server bound to `127.0.0.1` on a random port, opened in the default browser. The server rebuilds the report in the background every 60 seconds (`AGENT_MONITOR_DASHBOARD_REFRESH`, minimum 5) using the same accounting the TUI shows, and the page polls `/api/status` on that server and reloads when a newer report exists. It makes no other requests, nothing listens outside the loopback interface, and the exported `p` file remains script-free. Press `d` again to stop it; quitting `agent-monitor` stops it as well. Set `AGENT_MONITOR_NO_BROWSER=1` to skip opening the browser.
+
 The scoring policy and its limitations are documented in [docs/consumption-score.md](docs/consumption-score.md). The observed Codex thread/rollout/shard model and aggregation rules are documented separately in [docs/codex-session-storage.md](docs/codex-session-storage.md).
 
 ## Development
