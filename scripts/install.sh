@@ -33,6 +33,7 @@ fi
 
 mkdir -p "$LIB_DIR/tools" "$BIN_DIR"
 install -m 0755 "$ROOT/monitoring.py" "$LIB_DIR/monitoring.py"
+install -m 0644 "$ROOT/dashboard.html" "$LIB_DIR/dashboard.html"
 install -m 0755 "$ROOT/tools/codex_telemetry.py" "$LIB_DIR/tools/codex_telemetry.py"
 install -m 0755 "$ROOT/scripts/install-apple-container.sh" "$LIB_DIR/install-apple-container.sh"
 ln -sfn "$LIB_DIR/monitoring.py" "$BIN_DIR/agent-monitor"

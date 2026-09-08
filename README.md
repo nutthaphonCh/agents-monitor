@@ -63,9 +63,22 @@ Search input uses the terminal's Unicode-aware character API, so `/` accepts Tha
 
 On the Overall page only, `p` (or `P`) exports the same report as a single, self-contained offline HTML file — inline CSS, no external assets or network requests — to `~/Library/Caches/execution-profiler/overall-report.html`, opens it in the default browser, and shows the saved path in the bottom-right status area for 10 seconds. The project ranking itself is expandable in HTML, so model/session/file details live in one list rather than a duplicated second section. Everywhere else, `p` keeps its normal meaning: background processes for the selected prompt/session.
 
-`d` (or `D`) on the Overall or project page starts a live dashboard: the same report page served from a local server bound to `127.0.0.1` on a random port, opened in the default browser. The server rebuilds the report in the background every 60 seconds (`AGENT_MONITOR_DASHBOARD_REFRESH`, minimum 5) using the same accounting the TUI shows, and the page polls `/api/status` on that server and reloads when a newer report exists. It makes no other requests, nothing listens outside the loopback interface, and the exported `p` file remains script-free. Press `d` again to stop it; quitting `agent-monitor` stops it as well. Set `AGENT_MONITOR_NO_BROWSER=1` to skip opening the browser.
-
 The scoring policy and its limitations are documented in [docs/consumption-score.md](docs/consumption-score.md). The observed Codex thread/rollout/shard model and aggregation rules are documented separately in [docs/codex-session-storage.md](docs/codex-session-storage.md).
+
+## Detach mode
+
+`d` on any page detaches the view on screen into the browser: it starts a dashboard server bound to `127.0.0.1` on a random port (once per run), opens the default browser at the same place you were looking at, and keeps the terminal running. From a session it opens that session; from a prompt or request detail it opens that prompt or request (Codex continuation shards resolve to the right prompt); from Overall or a project it opens the overview or the project ranking. `D` stops the server; quitting `agent-monitor` stops it as well. Set `AGENT_MONITOR_NO_BROWSER=1` to skip opening the browser and just print the URL in the status area.
+
+The page is `dashboard.html`, one self-contained file with inline CSS and JavaScript that talks only to that loopback server. It has four tabs plus session browsing:
+
+- **Overview**: consumption or raw-token tiles (sessions, requests, active days, current streak, peak day, top model, cache hit, output), a per-day activity heatmap, and by-provider and by-model rankings; a model row expands into its fresh / cache-read / request split.
+- **Trends**: stacked daily bars by provider or by model with a legend of totals and shares.
+- **Sessions**: every analyzed session with search, provider filter, and sorting by recency, consumption, peak context, prompts, or project.
+- **Projects**: the same full-working-directory ranking as the terminal, expandable into model mix, top sessions, and top files.
+- **Session → prompt → request**: the same drill-down as the terminal. A session lists its prompts with status, latest context and cache percentage, output, thinking rounds, actors, and file operations; a prompt shows Requests, Actors, Timeline, Files, Context attribution, Sub-sessions, and Usage observation; a request shows each action's complete command and bounded output with a copy button for its Bash commands.
+
+The range switch (Today / 7d / 30d / 90d) and the unit switch (consumption score / raw tokens) apply everywhere; the choice is remembered per browser. Keyboard: `↑`/`↓` or `j`/`k` select, `↵`/`→` open, `←`/`esc` back, `1`-`4` switch tabs, `/` searches sessions, `u` toggles the unit, `r` reloads. The server rebuilds the report in the background every 60 seconds (`AGENT_MONITOR_DASHBOARD_REFRESH`, minimum 5) using the same accounting the terminal shows, so the dashboard never grows a second set of numbers; the page polls `/api/status` and refreshes itself when a newer report exists, and a live session re-reads on each poll. The JSON behind it is available at `/api/report`, `/api/session/<id>`, and `/api/session/<id>/prompt/<n>` on that server. The `p` export stays a static, script-free file.
+
 
 ## Development
 

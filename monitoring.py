@@ -15,6 +15,8 @@ Keys
   o / O       Overall consumption page
   p           background processes for the current session; on the Overall
               page, p/P instead exports a self-contained shareable HTML report
+  d / D       detach the current view to a browser dashboard served on
+              127.0.0.1 only (any page) / stop that dashboard
   Up / Down   move between prompts
   Right/Enter open; Left/Esc back
   PgUp/PgDn   scroll one page
@@ -325,6 +327,7 @@ class SessionUsage:
     peak_context: int = 0
     cache_hit_rate: float = 0.0
     path: str = ""
+    project_root: str = ""
 
 
 @dataclass
@@ -343,6 +346,8 @@ class ProjectUsage:
 class DayUsage:
     day: str
     usage: Usage = field(default_factory=Usage)
+    # Per-provider split of the same day, so a trend can stack claude/codex bars.
+    providers: dict[str, Usage] = field(default_factory=dict)
 
 
 @dataclass
@@ -358,6 +363,9 @@ class OverallReport:
     unreadable: int
     days: list[DayUsage]
     window_days: int = OVERALL_WINDOW_DAYS
+    # Every analyzed session in the window (not only each project's recent top list),
+    # newest first — the detached dashboard browses sessions from this.
+    sessions: list[SessionUsage] = field(default_factory=list)
 
     @property
     def excluded_old(self) -> int:
@@ -2173,6 +2181,24 @@ def session_identifier(path: str) -> str:
     return Path(path).stem
 
 
+def resolve_session_path(reference: str, paths: list[str] | None = None) -> str | None:
+    """Resolve a logical session ID, rollout filename, or unique prefix to a session file."""
+    needle = reference.strip().removeprefix("#")
+    if not needle:
+        return None
+    exact: list[str] = []
+    prefix: list[str] = []
+    for path in (paths if paths is not None else find_all_sessions()):
+        logical_id = session_identifier(path)
+        rollout = Path(path).stem
+        identities = (logical_id, rollout, display_rollout_id(rollout))
+        if needle in identities:
+            exact.append(path)
+        elif any(value.startswith(needle) for value in identities):
+            prefix.append(path)
+    return (exact or prefix or [None])[0]
+
+
 def display_rollout_id(value: str) -> str:
     """Shorten UUIDs inside a rollout name for display; never use this as an identity."""
     return re.sub(
@@ -2234,7 +2260,8 @@ def build_overall_report(
     projects: dict[str, ProjectUsage] = {}
     provider_usage: dict[str, Usage] = {"claude": Usage(), "codex": Usage()}
     provider_sessions: Counter[str] = Counter()
-    days: dict[str, Usage] = {}
+    days: dict[str, DayUsage] = {}
+    all_sessions: list[SessionUsage] = []
     prompt_count = 0
     session_count = 0
     unreadable = 0
@@ -2292,14 +2319,16 @@ def build_overall_report(
         session_time = max(parsed_timestamps) if parsed_timestamps else dt.datetime.fromtimestamp(
             ordering_time, tz=dt.timezone.utc,
         )
+        label = all_prompts[0].prompt if all_prompts else Path(path).stem
+        latest_context, peak_context, cache_hit_rate = session_context_summary(analyses)
+        session_usage = SessionUsage(
+            session_identifier(path), Path(path).stem if provider == "codex" else "",
+            len(shard_paths), label, session_time.astimezone(local_tz).isoformat(), provider, usage,
+            len(all_prompts), latest_context, peak_context, cache_hit_rate, path, project_root,
+        )
+        all_sessions.append(session_usage)
         if usage.total and session_time >= recent_cutoff:
-            label = all_prompts[0].prompt if all_prompts else Path(path).stem
-            latest_context, peak_context, cache_hit_rate = session_context_summary(analyses)
-            project.recent_sessions.append(SessionUsage(
-                session_identifier(path), Path(path).stem if provider == "codex" else "",
-                len(shard_paths), label, session_time.astimezone(local_tz).isoformat(), provider, usage,
-                len(all_prompts), latest_context, peak_context, cache_hit_rate, path,
-            ))
+            project.recent_sessions.append(session_usage)
 
         for prompt_turn in all_prompts:
             prompt_usage = prompt_turn.total_usage
@@ -2309,7 +2338,9 @@ def build_overall_report(
                 if stamp.tzinfo is None:
                     stamp = stamp.replace(tzinfo=dt.timezone.utc)
                 day = stamp.astimezone(local_tz).date().isoformat()
-                days.setdefault(day, Usage()).merge(prompt_usage)
+                bucket = days.setdefault(day, DayUsage(day))
+                bucket.usage.merge(prompt_usage)
+                bucket.providers.setdefault(provider, Usage()).merge(prompt_usage)
         if progress:
             progress(index, len(scoped))
 
@@ -2325,8 +2356,9 @@ def build_overall_report(
         discovered_count=discovered_count,
         prompt_count=prompt_count,
         unreadable=unreadable,
-        days=[DayUsage(day, usage) for day, usage in sorted(days.items())],
+        days=[days[day] for day in sorted(days)],
         window_days=window_days,
+        sessions=sorted(all_sessions, key=lambda item: item.timestamp or "", reverse=True),
     )
 
 
@@ -2729,24 +2761,9 @@ OVERALL_HTML_MAX_MODELS = 30
 OVERALL_HTML_MAX_TREND_DAYS = 90
 
 
-def render_overall_html(report: OverallReport, generated_at: str, live: dict[str, Any] | None = None) -> str:
-    """Render a single, offline, self-contained HTML usage report — inline CSS, no external assets.
-
-    The exported file carries no script at all. When ``live`` is given (the ``d`` dashboard),
-    one inline script polls the serving loopback server's ``/api/status`` and reloads the page
-    once a newer report has been built; it still talks to nothing but that server.
-    """
+def render_overall_html(report: OverallReport, generated_at: str) -> str:
+    """Render a single, offline, self-contained HTML usage report — inline CSS, no JS or external assets."""
     esc = html.escape
-    footer_note = "offline, self-contained report · no external assets or network requests"
-    live_script = ""
-    if live:
-        footer_note = (
-            f"live dashboard on {DASHBOARD_HOST} · report rebuilt every {live['refresh_seconds']:g}s"
-            f" · generated {esc(generated_at)}"
-        )
-        live_script = LIVE_DASHBOARD_SCRIPT.format(
-            version=int(live["version"]), poll_ms=int(live["poll_seconds"] * 1000),
-        )
     total = report.total
 
     def bar_row(label: str, value: float, whole: float, color: str, sub: str = "") -> str:
@@ -3032,9 +3049,9 @@ def render_overall_html(report: OverallReport, generated_at: str, live: dict[str
     counted separately in the scope line.
   </div>
 
-  <footer>agent-monitor · {footer_note}</footer>
+  <footer>agent-monitor · offline, self-contained report · no external assets or network requests</footer>
 </main>
-{live_script}</body>
+</body>
 </html>
 """
 
@@ -3077,47 +3094,240 @@ def open_overall_report(path: Path | None = None) -> tuple[bool, str]:
 
 
 DASHBOARD_HOST = "127.0.0.1"
-DASHBOARD_POLL_SECONDS = 5.0
-LIVE_DASHBOARD_SCRIPT = """<script>
-(function () {{
-  var version = {version};
-  function poll() {{
-    fetch("/api/status", {{cache: "no-store"}})
-      .then(function (response) {{ return response.json(); }})
-      .then(function (status) {{ if (status.version !== version) {{ location.reload(); }} }})
-      .catch(function () {{}});
-  }}
-  setInterval(poll, {poll_ms});
-}})();
-</script>
-"""
+DASHBOARD_HTML_PATH = Path(__file__).resolve().with_name("dashboard.html")
 
 
 def dashboard_refresh_seconds() -> float:
     return max(5.0, configured_weight("AGENT_MONITOR_DASHBOARD_REFRESH", 60.0))
 
 
-class OverallDashboardServer:
-    """Serve the Overall report on loopback and keep rebuilding it in the background.
+def usage_payload(usage: Usage) -> dict[str, Any]:
+    """JSON shape for a Usage: raw components plus the weighted score, never a price."""
+    return {
+        "input": usage.input, "output": usage.output,
+        "cache_create": usage.cache_create, "cache_read": usage.cache_read,
+        "total": usage.total, "fresh": usage.fresh, "context_total": usage.context_total,
+        "requests": usage.requests, "cache_hit_rate": round(usage.cache_hit_rate, 2),
+        "consumption": round(usage.consumption, 2),
+        "models": {
+            model: {
+                "requests": usage.models.get(model, 0),
+                "total": usage.model_totals.get(model, 0),
+                "fresh": usage.model_fresh.get(model, 0),
+                "cache": usage.model_cache.get(model, 0),
+                "consumption": round(usage.model_consumption.get(model, 0.0), 2),
+            }
+            for model in sorted(usage.model_totals.keys() | usage.models.keys())
+        },
+    }
 
-    The page is the same self-contained HTML that ``p`` exports, plus one inline script that
-    polls ``/api/status`` and reloads once a newer report exists. Nothing leaves the host: the
-    socket binds 127.0.0.1 only, the page requests nothing but that socket, and the report
-    itself is rebuilt with the same ``build_overall_report`` the TUI trusts, so the dashboard
-    never grows a second accounting.
+
+def session_usage_payload(item: SessionUsage) -> dict[str, Any]:
+    return {
+        "id": item.session_id, "rollout_id": item.rollout_id,
+        "display_id": display_rollout_id(item.rollout_id) if item.rollout_id else item.session_id,
+        "shards": item.rollout_count, "label": item.label, "timestamp": item.timestamp,
+        "provider": item.provider, "usage": usage_payload(item.usage), "prompts": item.prompt_count,
+        "latest_context": item.latest_context, "peak_context": item.peak_context,
+        "cache_hit_rate": round(item.cache_hit_rate, 2), "project_root": item.project_root,
+    }
+
+
+def report_payload(report: OverallReport, generated_at: str, version: int) -> dict[str, Any]:
+    """Everything the detached dashboard renders, derived from the same OverallReport the TUI shows."""
+    names = {project.root: project.name for project in report.projects}
+    return {
+        "version": version, "generated_at": generated_at,
+        "weights": {
+            "fresh": CONSUMPTION_CONFIG.fresh_weight, "cache": CONSUMPTION_CONFIG.cache_weight,
+        },
+        "window_days": report.window_days,
+        "scope": {
+            "sessions": report.session_count, "discovered": report.discovered_count,
+            "prompts": report.prompt_count, "unreadable": report.unreadable,
+            "excluded_old": report.excluded_old,
+        },
+        "total": usage_payload(report.total),
+        "providers": {
+            provider: {"usage": usage_payload(usage), "sessions": report.provider_sessions.get(provider, 0)}
+            for provider, usage in report.provider_usage.items()
+        },
+        "projects": [
+            {
+                "root": project.root, "name": project.name, "usage": usage_payload(project.usage),
+                "sessions": project.sessions, "prompts": project.prompts,
+                "files": [[path, count] for path, count in project.files.most_common(10)],
+            }
+            for project in report.projects
+        ],
+        "days": [
+            {
+                "day": day.day, "usage": usage_payload(day.usage),
+                "providers": {provider: usage_payload(usage) for provider, usage in day.providers.items()},
+            }
+            for day in report.days
+        ],
+        "sessions": [
+            {**session_usage_payload(item), "project": names.get(item.project_root, Path(item.project_root).name)}
+            for item in report.sessions
+        ],
+    }
+
+
+def prompt_status(prompt: PromptTurn, is_last: bool, session_is_live: bool) -> str:
+    if "Interrupted by user" in prompt.events:
+        return "interrupted"
+    if any(item.label == "Prompt completed" for item in prompt.timeline):
+        return "completed"
+    if is_last:
+        return "running" if session_is_live else "last observed"
+    return "completed"
+
+
+def prompt_summary_payload(prompt: PromptTurn, position: int, shard: str, status: str) -> dict[str, Any]:
+    usage = prompt.total_usage
+    return {
+        "position": position, "index": prompt.index, "shard": shard, "prompt": prompt.prompt,
+        "timestamp": prompt.timestamp, "status": status,
+        "latest_context": latest_context_size(prompt),
+        "latest_cache_hit_rate": round(latest_context_usage(prompt).cache_hit_rate, 2),
+        "usage": usage_payload(usage), "requests": len(prompt.requests),
+        "actors": len(prompt.actors) + (1 if prompt.main.total else 0),
+        "files": len(prompt.files), "events": list(prompt.events),
+        "sub_sessions": len(prompt.sub_sessions),
+    }
+
+
+def actor_payload(actor: Actor) -> dict[str, Any]:
+    started = parse_iso_timestamp(actor.started_at)
+    finished = parse_iso_timestamp(actor.finished_at)
+    return {
+        "key": actor.key, "label": actor.label, "status": actor.status,
+        "started_at": actor.started_at, "finished_at": actor.finished_at,
+        "elapsed_seconds": (finished - started).total_seconds() if started and finished else None,
+        "task_id": actor.task_id, "exit_code": actor.exit_code, "tool_use_id": actor.tool_use_id,
+        "working_dir": actor.working_dir, "thread_id": actor.thread_id,
+        "duration_seconds": actor.duration_seconds, "token_usage": dict(actor.token_usage),
+        "rate_limits": actor.rate_limits, "engine": actor.engine, "model": actor.model,
+        "mode": actor.mode, "lane": actor.lane, "verdict": actor.verdict,
+        "decision": actor.decision, "rationale": actor.rationale,
+    }
+
+
+def prompt_detail_payload(prompt: PromptTurn, position: int, shard: str, status: str) -> dict[str, Any]:
+    """The full prompt detail the terminal shows across its Actors/Timeline/Files/Requests pages."""
+    summary = prompt_summary_payload(prompt, position, shard, status)
+    timestamps = [value for value in (parse_iso_timestamp(item.timestamp) for item in prompt.timeline) if value]
+    summary.update({
+        "duration_seconds": max(0, round((timestamps[-1] - timestamps[0]).total_seconds())) if timestamps else None,
+        "main_actor": main_actor_name(prompt) if prompt.main.total else None,
+        "main": usage_payload(prompt.main),
+        "sub_sessions": [
+            {"key": sub.key, "label": sub.label, "usage": usage_payload(sub.usage)}
+            for sub in prompt.sub_sessions.values()
+        ],
+        "actors": [actor_payload(actor) for actor in prompt.actors],
+        "timeline": [
+            {"timestamp": item.timestamp, "label": item.label, "kind": item.kind} for item in prompt.timeline
+        ],
+        "files": [
+            {"timestamp": item.timestamp, "action": item.action, "path": item.path} for item in prompt.files
+        ],
+        "requests": [
+            {
+                "index": index, "timestamp": request.timestamp, "model": request.model,
+                "usage": usage_payload(request.usage), "stop_reason": request.stop_reason,
+                "actions": list(request.actions), "action_details": list(request.action_details),
+                "action_outputs": list(request.action_outputs),
+            }
+            for index, request in enumerate(prompt.requests, 1)
+        ],
+        "context": [[name, value] for name, value in context_attribution(prompt)],
+        "usage_observations": [
+            {
+                "before_time": item.before_time, "after_time": item.after_time,
+                "before_5h": item.before_5h, "after_5h": item.after_5h,
+                "before_weekly": item.before_weekly, "after_weekly": item.after_weekly,
+                "delta_5h": item.delta_5h, "delta_weekly": item.delta_weekly,
+                "confidence": item.confidence, "confidence_reason": item.confidence_reason,
+            }
+            for item in prompt.usage_observations
+        ],
+    })
+    return summary
+
+
+def load_session_analyses(path: str, cache: ProfilerCache | None) -> list[tuple[str, Analysis]]:
+    """(shard stem, analysis) for every rollout shard of a logical session, chronologically."""
+    shard_paths = codex_rollout_shards(path) if session_provider(path) == "codex" else [path]
+    analyses = []
+    for shard_path in shard_paths:
+        analyzer = cache.analyzer(shard_path) if cache else create_analyzer(shard_path)
+        analyses.append((Path(shard_path).stem, analyzer.analysis))
+    return analyses
+
+
+def session_detail_payload(path: str, cache: ProfilerCache | None, prompt_position: int | None = None) -> dict[str, Any]:
+    """Session summary with one row per prompt, or (with ``prompt_position``) one prompt in full."""
+    analyses = load_session_analyses(path, cache)
+    last_path = analyses[-1][1].path
+    session_is_live = time.time() - os.path.getmtime(last_path) < 2
+    flattened = [(shard, prompt) for shard, analysis in analyses for prompt in analysis.prompts]
+    prompts = []
+    for position, (shard, prompt) in enumerate(flattened, 1):
+        status = prompt_status(prompt, position == len(flattened), session_is_live)
+        if prompt_position is not None:
+            if position == prompt_position:
+                return prompt_detail_payload(prompt, position, shard, status)
+            continue
+        prompts.append(prompt_summary_payload(prompt, position, shard, status))
+    if prompt_position is not None:
+        raise KeyError(prompt_position)
+    total = Usage()
+    preamble = Usage()
+    for _, analysis in analyses:
+        total.merge(analysis.total_usage)
+        preamble.merge(analysis.preamble)
+    latest_context, peak_context, cache_hit_rate = session_context_summary([analysis for _, analysis in analyses])
+    provider = session_provider(path)
+    rollout = Path(path).stem if provider == "codex" else ""
+    return {
+        "id": session_identifier(path), "rollout_id": rollout,
+        "display_id": display_rollout_id(rollout) if rollout else session_identifier(path),
+        "provider": provider, "paths": [analysis.path for _, analysis in analyses],
+        "project_root": session_project_root(path), "live": session_is_live,
+        "usage": usage_payload(total), "preamble": usage_payload(preamble),
+        "latest_context": latest_context, "peak_context": peak_context,
+        "cache_hit_rate": round(cache_hit_rate, 2),
+        "malformed": sum(analysis.malformed for _, analysis in analyses),
+        "prompts": prompts,
+    }
+
+
+class DashboardServer:
+    """Serve the detached dashboard on loopback and keep its report fresh in the background.
+
+    ``d`` in the TUI detaches the current view into a browser. The page is ``dashboard.html``
+    next to this file: one self-contained page that renders ``/api/report`` (the same
+    ``OverallReport`` the TUI shows) and browses sessions through ``/api/session/<id>`` and
+    ``/api/session/<id>/prompt/<n>`` exactly the way the terminal does. Nothing leaves the
+    host: the socket binds 127.0.0.1 only and the page requests nothing but that socket.
     """
     def __init__(
         self, cache_path: str | None, initial: OverallReport | None = None,
         refresh_seconds: float | None = None,
         build: Callable[[ProfilerCache | None], OverallReport] | None = None,
+        html_path: Path | None = None,
     ) -> None:
         self.cache_path = cache_path
         self.refresh_seconds = refresh_seconds if refresh_seconds is not None else dashboard_refresh_seconds()
         self.build = build or build_overall_report
+        self.html_path = html_path or DASHBOARD_HTML_PATH
         self.lock = threading.Lock()
         self.version = 0
         self.generated_at = ""
-        self.html = ""
+        self.report: dict[str, Any] | None = None
+        self.session_paths: dict[str, str] = {}
         self.session_count = 0
         self.refreshing = False
         self.error = ""
@@ -3126,8 +3336,6 @@ class OverallDashboardServer:
         self.threads: list[threading.Thread] = []
         if initial is not None:
             self.publish(initial)
-        else:
-            self.html = self._placeholder_html()
 
     @property
     def url(self) -> str:
@@ -3139,13 +3347,15 @@ class OverallDashboardServer:
     def running(self) -> bool:
         return self.server is not None and not self.stop_event.is_set()
 
-    def _placeholder_html(self) -> str:
-        script = LIVE_DASHBOARD_SCRIPT.format(version=self.version, poll_ms=int(DASHBOARD_POLL_SECONDS * 1000))
-        return (
-            "<!doctype html><html><head><meta charset=\"utf-8\"><title>agent-monitor · overall</title></head>"
-            "<body><p>Building the Overall report… this page reloads when it is ready.</p>"
-            f"{script}</body></html>"
-        )
+    def page_html(self) -> str:
+        try:
+            return self.html_path.read_text(encoding="utf-8")
+        except OSError:
+            return (
+                "<!doctype html><meta charset=\"utf-8\"><title>agent-monitor</title>"
+                f"<p>dashboard.html is missing next to {html.escape(str(Path(__file__).resolve()))}; "
+                "the JSON API at /api/report is still available.</p>"
+            )
 
     def publish(self, report: OverallReport) -> int:
         generated_at = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -3153,10 +3363,12 @@ class OverallDashboardServer:
             self.version += 1
             self.generated_at = generated_at
             self.session_count = report.session_count
-            self.html = render_overall_html(report, generated_at, live={
-                "version": self.version, "refresh_seconds": self.refresh_seconds,
-                "poll_seconds": DASHBOARD_POLL_SECONDS,
-            })
+            self.report = report_payload(report, generated_at, self.version)
+            self.session_paths = {item.session_id: item.path for item in report.sessions}
+            for item in report.sessions:
+                if item.rollout_id:
+                    self.session_paths.setdefault(item.rollout_id, item.path)
+                    self.session_paths.setdefault(display_rollout_id(item.rollout_id), item.path)
             return self.version
 
     def status(self) -> dict[str, Any]:
@@ -3174,7 +3386,7 @@ class OverallDashboardServer:
             if self.cache_path:
                 background = ProfilerCache(self.cache_path)
             report = self.build(background)
-        except Exception as exc:  # keep the previous report on screen; surface the failure in /api/status
+        except Exception as exc:  # keep the previous report; surface the failure in /api/status
             self.error = str(exc)
             return False
         finally:
@@ -3191,6 +3403,26 @@ class OverallDashboardServer:
         while not self.stop_event.wait(self.refresh_seconds):
             self.rebuild()
 
+    def resolve_session(self, reference: str) -> str | None:
+        with self.lock:
+            known = self.session_paths.get(reference)
+        if known and Path(known).is_file():
+            return known
+        return resolve_session_path(reference)
+
+    def session_payload(self, reference: str, prompt_position: int | None = None) -> dict[str, Any] | None:
+        path = self.resolve_session(reference)
+        if not path:
+            return None
+        cache: ProfilerCache | None = None
+        try:
+            if self.cache_path:
+                cache = ProfilerCache(self.cache_path)
+            return session_detail_payload(path, cache, prompt_position)
+        finally:
+            if cache is not None:
+                cache.db.close()
+
     def _handler_class(self) -> type[BaseHTTPRequestHandler]:
         dashboard = self
 
@@ -3198,24 +3430,58 @@ class OverallDashboardServer:
             def log_message(self, *_: Any) -> None:
                 pass  # curses owns the terminal; never write request logs to it
 
-            def do_GET(self) -> None:
-                route = self.path.split("?", 1)[0]
-                if route in ("/", "/index.html"):
-                    with dashboard.lock:
-                        body = dashboard.html.encode("utf-8")
-                    content_type = "text/html; charset=utf-8"
-                elif route == "/api/status":
-                    body = json.dumps(dashboard.status()).encode("utf-8")
-                    content_type = "application/json"
-                else:
-                    self.send_error(404)
-                    return
-                self.send_response(200)
+            def send_json(self, payload: Any, status: int = 200) -> None:
+                self.send_body(json.dumps(payload, ensure_ascii=False).encode("utf-8"), "application/json", status)
+
+            def send_body(self, body: bytes, content_type: str, status: int = 200) -> None:
+                self.send_response(status)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(body)
+
+            def do_GET(self) -> None:
+                route = self.path.split("?", 1)[0]
+                if route in ("/", "/index.html"):
+                    self.send_body(dashboard.page_html().encode("utf-8"), "text/html; charset=utf-8")
+                    return
+                if route == "/api/status":
+                    self.send_json(dashboard.status())
+                    return
+                if route == "/api/report":
+                    with dashboard.lock:
+                        report = dashboard.report
+                    if report is None:
+                        self.send_json({"error": "report not built yet", **dashboard.status()}, 503)
+                    else:
+                        self.send_json(report)
+                    return
+                parts = [part for part in route.split("/") if part]
+                if len(parts) in (3, 5) and parts[:2] == ["api", "session"] and (len(parts) == 3 or parts[3] == "prompt"):
+                    from urllib.parse import unquote
+                    reference = unquote(parts[2])
+                    position: int | None = None
+                    if len(parts) == 5:
+                        try:
+                            position = int(parts[4])
+                        except ValueError:
+                            self.send_json({"error": "bad prompt position"}, 400)
+                            return
+                    try:
+                        payload = dashboard.session_payload(reference, position)
+                    except KeyError:
+                        self.send_json({"error": f"prompt {position} not found"}, 404)
+                        return
+                    except (OSError, sqlite3.Error) as exc:
+                        self.send_json({"error": str(exc)}, 500)
+                        return
+                    if payload is None:
+                        self.send_json({"error": f"session {reference} not found"}, 404)
+                    else:
+                        self.send_json(payload)
+                    return
+                self.send_json({"error": "not found"}, 404)
 
         return Handler
 
@@ -3581,7 +3847,7 @@ class TTYApp:
         self.overall_load_total = 0
         self.overall_load_error = ""
         self.overall_thread: threading.Thread | None = None
-        self.dashboard: OverallDashboardServer | None = None
+        self.dashboard: DashboardServer | None = None
         self.overall_project_cursor = 0
         self.project_session_cursor = 0
         self.selected_project = ""
@@ -3726,21 +3992,7 @@ class TTYApp:
 
     def find_session_path(self, reference: str) -> str | None:
         """Resolve a full logical session ID or rollout filename from the catalog."""
-        needle = reference.strip().removeprefix("#")
-        if not needle:
-            return None
-        paths = find_all_sessions()
-        exact: list[str] = []
-        prefix: list[str] = []
-        for path in paths:
-            logical_id = session_identifier(path)
-            rollout = Path(path).stem
-            identities = (logical_id, rollout, display_rollout_id(rollout))
-            if needle in identities:
-                exact.append(path)
-            elif any(value.startswith(needle) for value in identities):
-                prefix.append(path)
-        return (exact or prefix or [None])[0]
+        return resolve_session_path(reference)
 
     def selected_project_usage(self) -> ProjectUsage | None:
         if not self.overall_report:
@@ -3987,35 +4239,45 @@ class TTYApp:
         opened, open_message = open_overall_report()
         self.set_status_area(message if opened else f"{message} · {open_message}")
 
-    def toggle_dashboard(self) -> None:
-        if self.dashboard is not None:
-            self.dashboard.stop()
-            self.dashboard = None
-            self.set_status_area("Dashboard stopped")
-            return
-        if self.overall_load_state == "loading":
-            done, total = self.overall_load_progress, self.overall_load_total
-            progress = f" ({done}/{total})" if total else ""
-            self.set_status_area(f"Overall is still processing{progress}")
-            return
-        if self.overall_report is None:
-            self.set_status_area("Report unavailable · press r to retry")
-            return
-        server = OverallDashboardServer(str(self.cache.path) if self.cache else None, initial=self.overall_report)
-        try:
-            url = server.start()
-        except OSError as exc:
-            self.set_status_area(f"dashboard failed: {exc}")
-            return
-        self.dashboard = server
+    def detach_route(self) -> str:
+        """Hash route of the view on screen, so ``d`` opens the browser at the same place."""
+        if self.mode in {"overall", "project"}:
+            return "#/projects" if self.mode == "project" else "#/overview"
+        session = session_identifier(self.path)
+        route = f"#/session/{session}"
+        if self.mode in {"detail", "processes", "process_detail"} or (
+            self.mode == "list" and not self.follow
+        ):
+            route += f"/prompt/{self.selected_prompt}"
+            if self.mode == "detail" and self.detail_page.startswith("request:"):
+                route += f"/request/{int(self.detail_page.split(':', 1)[1]) + 1}"
+            if session_provider(self.path) == "codex":
+                route += f"?shard={Path(self.path).stem}"
+        return route
+
+    def detach(self) -> None:
+        """Open the current view in the browser, starting the loopback dashboard if needed."""
+        if self.dashboard is None:
+            server = DashboardServer(str(self.cache.path) if self.cache else None, initial=self.overall_report)
+            try:
+                server.start()
+            except OSError as exc:
+                self.set_status_area(f"detach failed: {exc}")
+                return
+            self.dashboard = server
+        url = self.dashboard.url + self.detach_route()
         opened, reason = open_in_browser(url)
         suffix = f" · {reason}" if reason else ""
-        self.set_status_area(f"live at {url} · d to stop{suffix}", duration=0 if opened else 10.0)
+        self.set_status_area(f"detached to {url} · D stops{suffix}", duration=0 if opened else 10.0)
 
-    def stop_dashboard(self) -> None:
+    def stop_dashboard(self, announce: bool = False) -> None:
         if self.dashboard is not None:
             self.dashboard.stop()
             self.dashboard = None
+            if announce:
+                self.set_status_area("Dashboard stopped")
+        elif announce:
+            self.set_status_area("No dashboard running · d to detach")
 
     def handle_key(self, key: int | str) -> bool:
         text_key = key if isinstance(key, str) else ""
@@ -4047,6 +4309,12 @@ class TTYApp:
                 self.search_query += text_key
             elif 32 <= key <= 126:
                 self.search_query += chr(key)
+            return True
+        if key == ord("d"):
+            self.detach()
+            return True
+        if key == ord("D"):
+            self.stop_dashboard(announce=True)
             return True
         if key == ord("/") and self.mode in {"list", "overall", "project"}:
             self.begin_search()
@@ -4093,8 +4361,6 @@ class TTYApp:
                 return False
             if key in (ord("p"), ord("P")):
                 self.export_overall_report()
-            elif key in (ord("d"), ord("D")):
-                self.toggle_dashboard()
             elif key in (27, curses.KEY_LEFT, ord("o"), ord("O")):
                 self.mode = "list"
             elif key == curses.KEY_DOWN:
@@ -4128,8 +4394,6 @@ class TTYApp:
                 self.mode = "overall"
             elif key in (ord("p"), ord("P")):
                 self.export_overall_report()
-            elif key in (ord("d"), ord("D")):
-                self.toggle_dashboard()
             elif key == curses.KEY_DOWN:
                 project = self.selected_project_usage()
                 sessions = sorted(
@@ -4368,11 +4632,10 @@ class TTYApp:
                     prefix = "> " if selected else "  "
                     rows.append((prefix + truncate_layout(line, width - len(prefix) - 1), attr))
             export_action = "p/P export + open" if self.overall_load_state == "ready" else "p/P after loading"
-            dashboard_action = "d stop live" if self.dashboard is not None else "d live dashboard"
             footer = fit_action_bar(
-                f" OVERALL │ ↑/↓ project │ → open │ PgUp/PgDn scroll │ {export_action} │ {dashboard_action}"
+                f" OVERALL │ ↑/↓ project │ → open │ PgUp/PgDn scroll │ {export_action} │ d detach"
                 " │ r refresh │ ← back │ q quit",
-                f" OVERALL │ ↑/↓ project │ → open │ {export_action} │ d live │ ← back",
+                f" OVERALL │ ↑/↓ project │ → open │ {export_action} │ d detach │ ← back",
                 width,
             )
         elif self.mode == "project":
@@ -4404,8 +4667,8 @@ class TTYApp:
                 rows.append((("> " if selected else "  ") + truncate_terminal_layout(line, width - 3), attr))
             footer = fit_action_bar(
                 " PROJECT │ ↑/↓ session │ → jump │ / search or #id │ PgUp/PgDn scroll │ p/P export + open"
-                " │ d live dashboard │ ← overall │ q quit",
-                " PROJECT │ ↑/↓ session │ → jump │ / search │ p export │ d live │ ← overall",
+                " │ d detach │ ← overall │ q quit",
+                " PROJECT │ ↑/↓ session │ → jump │ / search │ p export │ d detach │ ← overall",
                 width,
             )
         elif self.mode == "detail":
@@ -4486,6 +4749,7 @@ class TTYApp:
                 "x           Codex sessions",
                 "p           Spawned background agents for this session",
                 "o / O       Overall consumption page (all discovered sessions)",
+                "d / D       Detach this view to a loopback browser dashboard / stop it",
                 "/           Search current view",
                 "n / N       Next / previous search result",
                 "q           Quit",
@@ -4516,20 +4780,20 @@ class TTYApp:
                 ))
             if self.view == 1 and self.follow:
                 footer = fit_action_bar(
-                    " FOLLOW │ ↑/↓ prompt │ → open │ p processes │ o overall │ / search │ ? help │ q quit",
+                    " FOLLOW │ ↑/↓ prompt │ → open │ p processes │ o overall │ d detach │ / search │ ? help │ q quit",
                     " FOLLOW │ ↑/↓ │ → open │ p processes │ o overall │ / │ ? │ q",
                     width,
                 )
             elif self.view == 1:
                 updates = f"{self.new_events} updates │ " if self.new_events else ""
                 footer = fit_action_bar(
-                    f" PAUSED │ {updates}End follow │ ↑/↓ prompt │ → open │ p processes │ o overall │ / search │ ? help │ q quit",
+                    f" PAUSED │ {updates}End follow │ ↑/↓ prompt │ → open │ p processes │ o overall │ d detach │ / search │ ? help │ q quit",
                     f" PAUSED │ {updates}End follow │ → open │ p processes │ o overall │ / │ ? │ q",
                     width,
                 )
             else:
                 footer = fit_action_bar(
-                    " HISTORY │ ↑/↓ prompt │ → open │ p processes │ o overall │ / search │ ? help │ q quit",
+                    " HISTORY │ ↑/↓ prompt │ → open │ p processes │ o overall │ d detach │ / search │ ? help │ q quit",
                     " HISTORY │ ↑/↓ │ → open │ p processes │ o overall │ / │ ? │ q",
                     width,
                 )
