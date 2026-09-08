@@ -1883,3 +1883,154 @@ class OverallPageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def subagent_record(agent_id, prompt_id, **usage_kwargs):
+    record = assistant_usage(**usage_kwargs)
+    record.update({"isSidechain": True, "agentId": agent_id, "promptId": prompt_id})
+    return record
+
+
+class SubagentAccountingTests(unittest.TestCase):
+    def write_session(self, root, agent_records, meta=None):
+        session = Path(root) / "session-1.jsonl"
+        main_prompt = prompt()
+        main_prompt["promptId"] = "prompt-1"
+        session.write_text(
+            json.dumps(main_prompt) + "\n" + json.dumps(assistant_usage(inp=10, out=5)) + "\n",
+            encoding="utf-8",
+        )
+        agent_dir = Path(root) / "session-1" / "subagents"
+        agent_dir.mkdir(parents=True)
+        transcript = agent_dir / "agent-abc.jsonl"
+        transcript.write_text("".join(json.dumps(item) + "\n" for item in agent_records), encoding="utf-8")
+        if meta is not None:
+            (agent_dir / "agent-abc.meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        return session, transcript
+
+    def test_subagent_transcripts_are_attributed_to_their_prompt(self):
+        with tempfile.TemporaryDirectory() as root:
+            first = {
+                "type": "user", "isSidechain": True, "promptId": "prompt-1", "agentId": "abc",
+                "timestamp": "2026-07-20T10:00:02Z", "message": {"role": "user", "content": "Review"},
+            }
+            usage = subagent_record("abc", "prompt-1", inp=3, out=7, cache_read=100, timestamp="2026-07-20T10:00:03Z")
+            usage["requestId"] = "req-sub-1"
+            session, transcript = self.write_session(
+                root, [first, usage], meta={"agentType": "general-purpose", "description": "Review data flow"},
+            )
+            analyzer = monitoring.IncrementalSessionAnalyzer(str(session))
+            turn = analyzer.analysis.prompts[0]
+            self.assertEqual(turn.prompt_id, "prompt-1")
+            self.assertEqual(turn.main.total, 15)
+            self.assertEqual(list(turn.sub_sessions), ["agentId:abc"])
+            sub = turn.sub_sessions["agentId:abc"]
+            self.assertEqual(sub.label, "Review data flow · general-purpose")
+            self.assertEqual(sub.usage.total, 110)
+            self.assertEqual(turn.total_usage.total, 125)
+            self.assertEqual(analyzer.analysis.total_usage.total, 125)
+
+            # A streamed duplicate is merged once; a fresh request is appended live.
+            with open(transcript, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(usage) + "\n")
+                more = subagent_record("abc", "prompt-1", inp=1, out=1, timestamp="2026-07-20T10:00:04Z")
+                more["requestId"] = "req-sub-2"
+                fh.write(json.dumps(more) + "\n")
+            self.assertTrue(analyzer.poll())
+            self.assertEqual(sub.usage.requests, 2)
+            self.assertEqual(sub.usage.total, 112)
+            self.assertFalse(analyzer.poll())
+
+    def test_subagent_without_prompt_id_falls_back_to_timestamp(self):
+        with tempfile.TemporaryDirectory() as root:
+            usage = subagent_record("abc", None, inp=2, out=2, timestamp="2026-07-20T10:00:03Z")
+            del usage["promptId"]
+            session, _ = self.write_session(root, [usage])
+            turn = monitoring.IncrementalSessionAnalyzer(str(session)).analysis.prompts[0]
+            self.assertEqual(turn.sub_sessions["agentId:abc"].label, "fable sub-session")
+            self.assertEqual(turn.total_usage.total, 19)
+
+    def test_sqlite_cache_resumes_subagent_offsets(self):
+        cache_file = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+        cache_file.close()
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                usage = subagent_record("abc", "prompt-1", inp=3, out=7, timestamp="2026-07-20T10:00:03Z")
+                usage["requestId"] = "req-sub-1"
+                session, transcript = self.write_session(root, [usage])
+                cache = monitoring.ProfilerCache(cache_file.name)
+                first = cache.analyzer(str(session))
+                self.assertEqual(first.analysis.total_usage.total, 25)
+                offset = first.subagents[str(transcript)]["offset"]
+                self.assertEqual(offset, os.path.getsize(transcript))
+
+                more = subagent_record("abc", "prompt-1", inp=1, out=1, timestamp="2026-07-20T10:00:04Z")
+                more["requestId"] = "req-sub-2"
+                with open(transcript, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(more) + "\n")
+                resumed = cache.analyzer(str(session))
+                self.assertGreater(resumed.subagents[str(transcript)]["offset"], offset)
+                self.assertEqual(resumed.analysis.total_usage.total, 27)
+                self.assertEqual(resumed.analysis.prompts[0].sub_sessions["agentId:abc"].usage.requests, 2)
+                cache.db.close()
+        finally:
+            os.unlink(cache_file.name)
+
+
+class CodexTokenCountDedupTests(unittest.TestCase):
+    @staticmethod
+    def token_count(timestamp, last, total):
+        return {"type": "event_msg", "timestamp": timestamp, "payload": {
+            "type": "token_count", "info": {"last_token_usage": last, "total_token_usage": total},
+        }}
+
+    def write_rollout(self, records):
+        handle = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".jsonl", prefix="rollout-", delete=False, encoding="utf-8",
+        )
+        for record in records:
+            handle.write(json.dumps(record) + "\n")
+        handle.close()
+        return handle.name
+
+    def test_replayed_token_count_snapshots_are_counted_once(self):
+        first_last = {"input_tokens": 100, "cached_input_tokens": 70, "output_tokens": 5, "total_tokens": 105}
+        first_total = dict(first_last)
+        second_last = {"input_tokens": 40, "cached_input_tokens": 30, "output_tokens": 3, "total_tokens": 43}
+        second_total = {"input_tokens": 140, "cached_input_tokens": 100, "output_tokens": 8, "total_tokens": 148}
+        records = [item for item in codex_records() if item["payload"].get("type") != "token_count"]
+        records[-1:-1] = [
+            self.token_count("2026-07-20T10:00:04Z", first_last, first_total),
+            # Codex re-emits the identical snapshot when only rate limits refresh.
+            self.token_count("2026-07-20T10:00:05Z", first_last, first_total),
+            self.token_count("2026-07-20T10:00:06Z", second_last, second_total),
+        ]
+        path = self.write_rollout(records)
+        try:
+            turn = monitoring.create_analyzer(path).analysis.prompts[0]
+            self.assertEqual(turn.main.requests, 2)
+            self.assertEqual(len(turn.requests), 2)
+            self.assertEqual(turn.main.context_total, 140)
+            self.assertEqual(turn.main.cache_read, 100)
+            self.assertEqual(turn.main.output, 8)
+        finally:
+            os.unlink(path)
+
+    def test_dedup_baseline_survives_cache_resume(self):
+        last = {"input_tokens": 100, "cached_input_tokens": 70, "output_tokens": 5, "total_tokens": 105}
+        records = [item for item in codex_records() if item["payload"].get("type") != "token_count"]
+        records[-1:-1] = [self.token_count("2026-07-20T10:00:04Z", last, dict(last))]
+        path = self.write_rollout(records)
+        cache_file = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+        cache_file.close()
+        try:
+            cache = monitoring.ProfilerCache(cache_file.name)
+            cache.analyzer(path)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(self.token_count("2026-07-20T10:00:07Z", last, dict(last))) + "\n")
+            resumed = cache.analyzer(path)
+            self.assertEqual(resumed.analysis.prompts[0].main.requests, 1)
+            cache.db.close()
+        finally:
+            os.unlink(path)
+            os.unlink(cache_file.name)

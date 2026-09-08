@@ -59,7 +59,7 @@ from typing import Any, Callable
 
 
 REFRESH_INTERVAL = 0.5
-CACHE_SCHEMA_VERSION = 12
+CACHE_SCHEMA_VERSION = 13
 ESCAPE_DELAY_MS = 25
 ACTION_NAMES = (
     "WebSearch", "WebFetch", "Bash", "Write", "Edit", "Read", "Glob", "Grep", "Search",
@@ -273,6 +273,9 @@ class PromptTurn:
     usage_observations: list[UsageObservation] = field(default_factory=list)
     accounted_usage_keys: set[str] = field(default_factory=set, repr=False)
     request_info_keys: set[str] = field(default_factory=set, repr=False)
+    # Claude Code stamps every record of a turn, and the first record of each spawned
+    # subagent transcript, with the same ``promptId``; it links the two files.
+    prompt_id: str | None = None
 
     @property
     def total_usage(self) -> Usage:
@@ -830,6 +833,7 @@ def analyze(path: str) -> Analysis:
                     prompt=prompt_text(rec),
                     start_sequence=sequence,
                     timestamp=rec.get("timestamp"),
+                    prompt_id=rec.get("promptId") or None,
                 )
                 prompts.append(current)
                 continue
@@ -1386,6 +1390,32 @@ def enrich_analysis(path: str, analysis: Analysis) -> dict[str, tuple[PromptTurn
     return tools
 
 
+SUBAGENT_DIR_NAME = "subagents"
+
+
+def subagent_directory(path: str) -> Path:
+    """Claude Code keeps the agents a session spawned under ``<session>/subagents/``.
+
+    Their transcripts are separate JSONL files (``agent-<id>.jsonl``, possibly nested under
+    ``workflows/``), so the parent transcript itself no longer carries ``isSidechain`` usage.
+    """
+    return Path(path).with_suffix("") / SUBAGENT_DIR_NAME
+
+
+def subagent_label(transcript_path: str, model: str) -> str:
+    """Prefer the sidecar ``agent-<id>.meta.json`` description over a model-only label."""
+    try:
+        meta = json.loads(Path(transcript_path).with_suffix(".meta.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        meta = None
+    if isinstance(meta, dict):
+        parts = [str(meta.get(key) or "").strip() for key in ("description", "agentType")]
+        label = " · ".join(part for part in parts if part)
+        if label:
+            return truncate(label, 80)
+    return f"{short_model(model)} sub-session"
+
+
 class IncrementalSessionAnalyzer:
     """Parse an existing session once, then consume only newly appended JSONL bytes."""
     def __init__(self, path: str) -> None:
@@ -1395,8 +1425,16 @@ class IncrementalSessionAnalyzer:
         self.offset = os.path.getsize(path)
         self.sequence = self.analysis.record_count
         self.partial = ""
+        # Per subagent transcript: consumed byte offset, trailing partial line, and the
+        # index of the prompt it was attributed to once its first record was read.
+        self.subagents: dict[str, dict[str, Any]] = {}
+        self._poll_subagents()
 
     def poll(self) -> bool:
+        changed = self._poll_main()
+        return self._poll_subagents() or changed
+
+    def _poll_main(self) -> bool:
         size = os.path.getsize(self.path)
         if size < self.offset:
             self.__init__(self.path)
@@ -1427,6 +1465,86 @@ class IncrementalSessionAnalyzer:
             changed = True
         return changed
 
+    def _poll_subagents(self) -> bool:
+        directory = subagent_directory(self.path)
+        if not directory.is_dir():
+            return False
+        changed = False
+        for transcript in sorted(directory.rglob("*.jsonl")):
+            key = str(transcript)
+            state = self.subagents.get(key)
+            if state is None:
+                state = self.subagents[key] = {
+                    "offset": 0, "partial": "", "prompt_index": None,
+                    "agent_id": transcript.stem.removeprefix("agent-"),
+                }
+            try:
+                size = os.path.getsize(key)
+            except OSError:
+                continue
+            if size < state["offset"]:
+                # Rewritten transcript: re-read it; request-id dedup keeps totals stable.
+                state["offset"], state["partial"] = 0, ""
+            if size == state["offset"]:
+                continue
+            with open(key, "r", encoding="utf-8") as fh:
+                fh.seek(state["offset"])
+                chunk = fh.read()
+                state["offset"] = fh.tell()
+            lines = (state["partial"] + chunk).splitlines(keepends=True)
+            state["partial"] = ""
+            if lines and not lines[-1].endswith(("\n", "\r")):
+                state["partial"] = lines.pop()
+            for line in lines:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    self.analysis.malformed += 1
+                    continue
+                if isinstance(rec, dict) and self._append_subagent_record(rec, key, state):
+                    changed = True
+        return changed
+
+    def _subagent_prompt(self, rec: dict[str, Any], state: dict[str, Any]) -> PromptTurn | None:
+        if state["prompt_index"] is not None:
+            return next((p for p in self.analysis.prompts if p.index == state["prompt_index"]), None)
+        prompts = self.analysis.prompts
+        if not prompts:
+            return None
+        prompt_id = rec.get("promptId")
+        match = next((p for p in prompts if prompt_id and p.prompt_id == prompt_id), None)
+        if match is None:
+            stamp = parse_iso_timestamp(rec.get("timestamp"))
+            if stamp:
+                started = [(parse_iso_timestamp(p.timestamp), p) for p in prompts]
+                match = next((p for at, p in reversed(started) if at and at <= stamp), None)
+        match = match or prompts[-1]
+        state["prompt_index"] = match.index
+        return match
+
+    def _append_subagent_record(self, rec: dict[str, Any], transcript: str, state: dict[str, Any]) -> bool:
+        prompt = self._subagent_prompt(rec, state)
+        usage_tuple = extract_usage(rec)
+        if not usage_tuple:
+            return False
+        model, inp, out, cache_create, cache_read = usage_tuple
+        usage = Usage()
+        usage.add(model, inp, out, cache_create, cache_read)
+        if prompt is None:
+            self.analysis.preamble.merge(usage)
+            return True
+        usage_key = usage_identity(rec)
+        if usage_key and usage_key in prompt.accounted_usage_keys:
+            return False
+        if usage_key:
+            prompt.accounted_usage_keys.add(usage_key)
+        key = f"agentId:{state['agent_id']}"
+        sub = prompt.sub_sessions.get(key)
+        if sub is None:
+            sub = prompt.sub_sessions[key] = SubSession(key, subagent_label(transcript, model), prompt.start_sequence)
+        sub.usage.merge(usage)
+        return True
+
     def _append_record(self, rec: dict[str, Any]) -> None:
         if is_real_user_prompt(rec):
             previous = self.analysis.prompts[-1] if self.analysis.prompts else None
@@ -1435,7 +1553,10 @@ class IncrementalSessionAnalyzer:
                 for actor in self.analysis.prompts[-1].actors:
                     if actor.key == "main" and actor.status == "running":
                         actor.status = "completed"
-            prompt = PromptTurn(len(self.analysis.prompts) + 1, prompt_text(rec), self.sequence, rec.get("timestamp"))
+            prompt = PromptTurn(
+                len(self.analysis.prompts) + 1, prompt_text(rec), self.sequence, rec.get("timestamp"),
+                prompt_id=rec.get("promptId") or None,
+            )
             if previous:
                 prompt.evidence_chars.update(previous.evidence_chars)
             prompt.timeline.append(TimelineItem(rec.get("timestamp"), "Prompt started", "prompt"))
@@ -1552,6 +1673,9 @@ class CodexSessionAnalyzer:
         self.pending_action_outputs: list[str] = []
         self.pending_cells: dict[str, Actor] = {}
         self.base_evidence: Counter[str] = Counter()
+        # Cumulative usage of the last accepted token_count; Codex replays a snapshot
+        # verbatim (e.g. when only rate limits refresh), and that replay is not a request.
+        self.previous_total: dict[str, Any] | None = None
         self.poll()
 
     def poll(self) -> bool:
@@ -1717,6 +1841,11 @@ class CodexSessionAnalyzer:
             last = info.get("last_token_usage") if isinstance(info, dict) else None
             if not isinstance(last, dict):
                 return
+            total = info.get("total_token_usage")
+            if isinstance(total, dict):
+                if total == self.previous_total:
+                    return
+                self.previous_total = total
             total_input = int(last.get("input_tokens", 0) or 0)
             cached = int(last.get("cached_input_tokens", 0) or 0)
             output = int(last.get("output_tokens", 0) or 0)
@@ -1878,6 +2007,13 @@ class ProfilerCache:
                     if actor.status == "running" and actor.task_id
                 }
                 analyzer.base_evidence = Counter(state.get("base_evidence") or {})
+                previous_total = state.get("previous_total")
+                analyzer.previous_total = previous_total if isinstance(previous_total, dict) else None
+            else:
+                analyzer.subagents = {
+                    str(key): dict(item) for key, item in (state.get("subagents") or {}).items()
+                    if isinstance(item, dict)
+                }
             analyzer.tools = {}
             for tool_id, tool in state.get("tools", {}).items():
                 prompt = next((item for item in analysis.prompts if item.index == tool[0]), None)
@@ -1904,6 +2040,8 @@ class ProfilerCache:
             "pending_action_details": getattr(analyzer, "pending_action_details", []),
             "pending_action_outputs": getattr(analyzer, "pending_action_outputs", []),
             "base_evidence": dict(getattr(analyzer, "base_evidence", {})),
+            "previous_total": getattr(analyzer, "previous_total", None),
+            "subagents": getattr(analyzer, "subagents", {}),
         }, ensure_ascii=False, separators=(",", ":"))
         try:
             self.db.execute("""
