@@ -193,8 +193,17 @@ footer { color: var(--muted); font-family: var(--mono); font-size: 11px; margin:
   // ---------- fetching
   async function getJSON(url) { const res = await fetch(url, {cache: "no-store"}); if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText); return res.json(); }
   async function loadReport() {
-    try { state.report = await getJSON("/api/report"); state.version = state.report.version; render(); }
-    catch (e) { $("#main").innerHTML = `<div class="empty">${esc(e.message)} · retrying…</div>`; }
+    try { state.report = await getJSON("/api/report"); state.version = state.report.version; state.building = null; render(); }
+    catch (e) { state.building = state.building || {progress: [0, 0]}; render(); }
+  }
+  function buildingPanel() {
+    const [done, total] = (state.building && state.building.progress) || [0, 0];
+    const err = state.building && state.building.error;
+    return `<div class="panel" style="max-width:560px;margin:60px auto;text-align:center">
+      <div style="font-size:15px;margin-bottom:8px">${err ? "Report build failed" : "Building the report…"}</div>
+      <div class="muted" style="margin-bottom:12px">${err ? esc(err) : total ? `${done} of ${total} sessions analyzed` : "discovering sessions"}</div>
+      <div class="track" style="height:8px"><div class="fill" style="width:${total ? pct(done, total).toFixed(1) : 0}%"></div></div>
+      <div class="hint">the terminal keeps running · this page fills in by itself · sessions can be opened right away from <a href="#/sessions">the session list</a> once the report exists, or via a detached session link</div></div>`;
   }
   async function loadSession(id, force) {
     if (!force && state.sessions[id]) return state.sessions[id];
@@ -209,7 +218,9 @@ footer { color: var(--muted); font-family: var(--mono); font-size: 11px; margin:
     try {
       const s = await getJSON("/api/status");
       const dot = $("#dot"); dot.className = "dot" + (s.error ? " err" : s.refreshing ? " busy" : "");
-      $("#livetext").textContent = `v${s.version} · ${s.generated_at || "building…"}${s.refreshing ? " · rebuilding" : ""}${s.error ? " · " + s.error : ""}`;
+      const prog = s.refreshing && s.progress && s.progress[1] ? ` ${s.progress[0]}/${s.progress[1]}` : "";
+      $("#livetext").textContent = s.ready ? `v${s.version} · ${s.generated_at}${s.refreshing ? " · rebuilding" + prog : ""}${s.error ? " · " + s.error : ""}` : `building report${prog}…${s.error ? " · " + s.error : ""}`;
+      if (!s.ready) { state.building = {progress: s.progress || [0, 0], error: s.error}; if (state.route && state.route.view !== "session") render(); }
       if (s.version !== state.version && s.version > 0) {
         state.sessions = {}; state.prompts = {};
         await loadReport();
@@ -225,9 +236,9 @@ footer { color: var(--muted); font-family: var(--mono); font-size: 11px; margin:
     document.querySelectorAll("#tabs a").forEach((a) => a.classList.toggle("on", a.dataset.tab === (state.route.view === "session" ? "sessions" : state.route.view)));
     document.querySelectorAll("#range button").forEach((b) => b.classList.toggle("on", Number(b.dataset.range) === state.range));
     document.querySelectorAll("#unit button").forEach((b) => b.classList.toggle("on", b.dataset.unit === state.unit));
-    if (!state.report) return;
     const main = $("#main");
     const v = state.route.view;
+    if (!state.report && v !== "session") { main.innerHTML = buildingPanel(); return; }
     if (v === "overview") main.innerHTML = renderOverview();
     else if (v === "trends") main.innerHTML = renderTrends();
     else if (v === "sessions") main.innerHTML = renderSessions();
@@ -458,7 +469,7 @@ footer { color: var(--muted); font-family: var(--mono); font-size: 11px; margin:
   });
   window.addEventListener("hashchange", () => { render(); });
   loadReport().then(poll);
-  setInterval(poll, 5000);
+  setInterval(() => { poll(); }, 2000);
 })();
 </script>
 </body>

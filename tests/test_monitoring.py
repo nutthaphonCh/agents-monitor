@@ -2091,7 +2091,7 @@ class DetachedDashboardTests(unittest.TestCase):
         ))
         server = monitoring.DashboardServer(
             None, initial=small_overall_report(), refresh_seconds=3600,
-            build=lambda cache: rebuilt, html_path=Path(html_file.name),
+            build=lambda cache, progress=None: rebuilt, html_path=Path(html_file.name),
         )
         url = server.start()
         try:
@@ -2108,7 +2108,7 @@ class DetachedDashboardTests(unittest.TestCase):
             self.assertTrue(server.rebuild())
             with urllib.request.urlopen(url + "api/status") as response:
                 status = json.loads(response.read())
-            self.assertEqual((status["version"], status["sessions"]), (2, 7))
+            self.assertEqual((status["version"], status["sessions"], status["ready"]), (2, 7, True))
             with urllib.request.urlopen(url + "api/session/" + first["sessionId"]) as response:
                 session = json.loads(response.read())
             self.assertEqual(session["provider"], "claude")
@@ -2136,7 +2136,7 @@ class DetachedDashboardTests(unittest.TestCase):
             urllib.request.urlopen(url, timeout=1)
 
     def test_failed_rebuild_keeps_previous_report_and_reports_error(self):
-        def explode(cache):
+        def explode(cache, progress=None):
             raise RuntimeError("disk on fire")
 
         server = monitoring.DashboardServer(None, initial=small_overall_report(), refresh_seconds=3600, build=explode)
@@ -2166,7 +2166,11 @@ class DetachedDashboardTests(unittest.TestCase):
                 self.assertIsNotNone(app.dashboard)
                 self.assertTrue(app.dashboard.running)
                 self.assertIn("#/session/" + first["sessionId"], app.transient_status)
+                self.assertIn("building report in the background", app.transient_status)
                 self.assertIn("browser opening disabled", app.transient_status)
+                self.assertFalse(app.dashboard.status()["ready"])
+                app.dashboard.on_publish(1)
+                self.assertTrue(app.transient_status.startswith("Dashboard ready · http://127.0.0.1:"))
 
                 app.mode = "detail"
                 app.selected_prompt = 1

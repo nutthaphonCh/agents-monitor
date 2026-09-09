@@ -3316,13 +3316,16 @@ class DashboardServer:
     def __init__(
         self, cache_path: str | None, initial: OverallReport | None = None,
         refresh_seconds: float | None = None,
-        build: Callable[[ProfilerCache | None], OverallReport] | None = None,
+        build: Callable[..., OverallReport] | None = None,
         html_path: Path | None = None,
+        on_publish: Callable[[int], None] | None = None,
     ) -> None:
         self.cache_path = cache_path
         self.refresh_seconds = refresh_seconds if refresh_seconds is not None else dashboard_refresh_seconds()
         self.build = build or build_overall_report
         self.html_path = html_path or DASHBOARD_HTML_PATH
+        self.on_publish = on_publish
+        self.progress = (0, 0)
         self.lock = threading.Lock()
         self.version = 0
         self.generated_at = ""
@@ -3369,23 +3372,32 @@ class DashboardServer:
                 if item.rollout_id:
                     self.session_paths.setdefault(item.rollout_id, item.path)
                     self.session_paths.setdefault(display_rollout_id(item.rollout_id), item.path)
-            return self.version
+            version = self.version
+        if self.on_publish is not None:
+            self.on_publish(version)
+        return version
 
     def status(self) -> dict[str, Any]:
         with self.lock:
             return {
-                "version": self.version, "generated_at": self.generated_at,
+                "version": self.version, "ready": self.version > 0, "generated_at": self.generated_at,
                 "sessions": self.session_count, "refreshing": self.refreshing,
+                "progress": list(self.progress),
                 "refresh_seconds": self.refresh_seconds, "error": self.error,
             }
 
     def rebuild(self) -> bool:
         self.refreshing = True
+        self.progress = (0, 0)
         background: ProfilerCache | None = None
+
+        def update_progress(done: int, total: int) -> None:
+            self.progress = (done, total)
+
         try:
             if self.cache_path:
                 background = ProfilerCache(self.cache_path)
-            report = self.build(background)
+            report = self.build(background, progress=update_progress)
         except Exception as exc:  # keep the previous report; surface the failure in /api/status
             self.error = str(exc)
             return False
@@ -4257,18 +4269,29 @@ class TTYApp:
 
     def detach(self) -> None:
         """Open the current view in the browser, starting the loopback dashboard if needed."""
+        started = False
         if self.dashboard is None:
-            server = DashboardServer(str(self.cache.path) if self.cache else None, initial=self.overall_report)
+            def announce_ready(version: int) -> None:
+                if version == 1 and self.dashboard is not None:
+                    self.set_status_area(f"Dashboard ready · {self.dashboard.url} · D stops", duration=0)
+
+            server = DashboardServer(
+                str(self.cache.path) if self.cache else None, initial=self.overall_report,
+                on_publish=announce_ready,
+            )
             try:
                 server.start()
             except OSError as exc:
                 self.set_status_area(f"detach failed: {exc}")
                 return
             self.dashboard = server
+            started = True
         url = self.dashboard.url + self.detach_route()
         opened, reason = open_in_browser(url)
         suffix = f" · {reason}" if reason else ""
-        self.set_status_area(f"detached to {url} · D stops{suffix}", duration=0 if opened else 10.0)
+        building = started and self.dashboard.version == 0
+        state = "detached · building report in the background" if building else "detached"
+        self.set_status_area(f"{state} · {url} · D stops{suffix}", duration=0 if opened else 10.0)
 
     def stop_dashboard(self, announce: bool = False) -> None:
         if self.dashboard is not None:
