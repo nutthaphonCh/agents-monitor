@@ -1539,6 +1539,37 @@ class OverallPageTests(unittest.TestCase):
             self.assertIn(f"full rollout {current.stem}", html_text)
             self.assertIn("2 shard(s)", html_text)
 
+    def test_codex_tui_analysis_merges_shards_and_renumbers_prompts(self):
+        thread_id = "01a06201-c11e-7430-9dc1-57700eb22393"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            first = Path(tmp_dir) / f"rollout-2026-07-20T10-00-00-{thread_id}.jsonl"
+            current = Path(tmp_dir) / (
+                f"rollout-2026-07-20T11-00-00-{thread_id}_"
+                "01a0624a-fb7e-7531-a77e-de8c2abc4417.jsonl"
+            )
+            for path, prompt_text, timestamp in (
+                (first, "Earlier prompt", "2026-07-20T10:00:01Z"),
+                (current, "Continuation prompt", "2026-07-20T11:00:01Z"),
+            ):
+                records = codex_records()
+                records[0]["payload"]["id"] = thread_id
+                records[0]["payload"]["session_id"] = thread_id
+                records[3]["timestamp"] = timestamp
+                records[3]["payload"]["item"]["content"][0]["text"] = prompt_text
+                path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+            current_analyzer = monitoring.create_analyzer(str(current))
+            analysis = monitoring.merged_session_analysis(
+                str(current), current_analyzer=current_analyzer,
+            )
+
+            self.assertEqual([prompt.prompt for prompt in analysis.prompts], [
+                "Earlier prompt", "Continuation prompt",
+            ])
+            self.assertEqual([prompt.index for prompt in analysis.prompts], [1, 2])
+            self.assertEqual(analysis.record_count, len(codex_records()) * 2)
+            self.assertEqual(len(monitoring.history_feed(analysis)), 2)
+
     def test_codex_rollout_display_id_strips_each_uuid_tail(self):
         root = "rollout-2026-09-03T16-30-06-01a0669a-a7a5-71f1-8431-59a6fa3c6ce0"
         shard = (
@@ -1883,3 +1914,311 @@ class OverallPageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def subagent_record(agent_id, prompt_id, **usage_kwargs):
+    record = assistant_usage(**usage_kwargs)
+    record.update({"isSidechain": True, "agentId": agent_id, "promptId": prompt_id})
+    return record
+
+
+class SubagentAccountingTests(unittest.TestCase):
+    def write_session(self, root, agent_records, meta=None):
+        session = Path(root) / "session-1.jsonl"
+        main_prompt = prompt()
+        main_prompt["promptId"] = "prompt-1"
+        session.write_text(
+            json.dumps(main_prompt) + "\n" + json.dumps(assistant_usage(inp=10, out=5)) + "\n",
+            encoding="utf-8",
+        )
+        agent_dir = Path(root) / "session-1" / "subagents"
+        agent_dir.mkdir(parents=True)
+        transcript = agent_dir / "agent-abc.jsonl"
+        transcript.write_text("".join(json.dumps(item) + "\n" for item in agent_records), encoding="utf-8")
+        if meta is not None:
+            (agent_dir / "agent-abc.meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        return session, transcript
+
+    def test_subagent_transcripts_are_attributed_to_their_prompt(self):
+        with tempfile.TemporaryDirectory() as root:
+            first = {
+                "type": "user", "isSidechain": True, "promptId": "prompt-1", "agentId": "abc",
+                "timestamp": "2026-07-20T10:00:02Z", "message": {"role": "user", "content": "Review"},
+            }
+            usage = subagent_record("abc", "prompt-1", inp=3, out=7, cache_read=100, timestamp="2026-07-20T10:00:03Z")
+            usage["requestId"] = "req-sub-1"
+            session, transcript = self.write_session(
+                root, [first, usage], meta={"agentType": "general-purpose", "description": "Review data flow"},
+            )
+            analyzer = monitoring.IncrementalSessionAnalyzer(str(session))
+            turn = analyzer.analysis.prompts[0]
+            self.assertEqual(turn.prompt_id, "prompt-1")
+            self.assertEqual(turn.main.total, 15)
+            self.assertEqual(list(turn.sub_sessions), ["agentId:abc"])
+            sub = turn.sub_sessions["agentId:abc"]
+            self.assertEqual(sub.label, "Review data flow · general-purpose")
+            self.assertEqual(sub.usage.total, 110)
+            self.assertEqual(turn.total_usage.total, 125)
+            self.assertEqual(analyzer.analysis.total_usage.total, 125)
+
+            # A streamed duplicate is merged once; a fresh request is appended live.
+            with open(transcript, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(usage) + "\n")
+                more = subagent_record("abc", "prompt-1", inp=1, out=1, timestamp="2026-07-20T10:00:04Z")
+                more["requestId"] = "req-sub-2"
+                fh.write(json.dumps(more) + "\n")
+            self.assertTrue(analyzer.poll())
+            self.assertEqual(sub.usage.requests, 2)
+            self.assertEqual(sub.usage.total, 112)
+            self.assertFalse(analyzer.poll())
+
+    def test_subagent_without_prompt_id_falls_back_to_timestamp(self):
+        with tempfile.TemporaryDirectory() as root:
+            usage = subagent_record("abc", None, inp=2, out=2, timestamp="2026-07-20T10:00:03Z")
+            del usage["promptId"]
+            session, _ = self.write_session(root, [usage])
+            turn = monitoring.IncrementalSessionAnalyzer(str(session)).analysis.prompts[0]
+            self.assertEqual(turn.sub_sessions["agentId:abc"].label, "fable sub-session")
+            self.assertEqual(turn.total_usage.total, 19)
+
+    def test_sqlite_cache_resumes_subagent_offsets(self):
+        cache_file = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+        cache_file.close()
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                usage = subagent_record("abc", "prompt-1", inp=3, out=7, timestamp="2026-07-20T10:00:03Z")
+                usage["requestId"] = "req-sub-1"
+                session, transcript = self.write_session(root, [usage])
+                cache = monitoring.ProfilerCache(cache_file.name)
+                first = cache.analyzer(str(session))
+                self.assertEqual(first.analysis.total_usage.total, 25)
+                offset = first.subagents[str(transcript)]["offset"]
+                self.assertEqual(offset, os.path.getsize(transcript))
+
+                more = subagent_record("abc", "prompt-1", inp=1, out=1, timestamp="2026-07-20T10:00:04Z")
+                more["requestId"] = "req-sub-2"
+                with open(transcript, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(more) + "\n")
+                resumed = cache.analyzer(str(session))
+                self.assertGreater(resumed.subagents[str(transcript)]["offset"], offset)
+                self.assertEqual(resumed.analysis.total_usage.total, 27)
+                self.assertEqual(resumed.analysis.prompts[0].sub_sessions["agentId:abc"].usage.requests, 2)
+                cache.db.close()
+        finally:
+            os.unlink(cache_file.name)
+
+
+class CodexTokenCountDedupTests(unittest.TestCase):
+    @staticmethod
+    def token_count(timestamp, last, total):
+        return {"type": "event_msg", "timestamp": timestamp, "payload": {
+            "type": "token_count", "info": {"last_token_usage": last, "total_token_usage": total},
+        }}
+
+    def write_rollout(self, records):
+        handle = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".jsonl", prefix="rollout-", delete=False, encoding="utf-8",
+        )
+        for record in records:
+            handle.write(json.dumps(record) + "\n")
+        handle.close()
+        return handle.name
+
+    def test_replayed_token_count_snapshots_are_counted_once(self):
+        first_last = {"input_tokens": 100, "cached_input_tokens": 70, "output_tokens": 5, "total_tokens": 105}
+        first_total = dict(first_last)
+        second_last = {"input_tokens": 40, "cached_input_tokens": 30, "output_tokens": 3, "total_tokens": 43}
+        second_total = {"input_tokens": 140, "cached_input_tokens": 100, "output_tokens": 8, "total_tokens": 148}
+        records = [item for item in codex_records() if item["payload"].get("type") != "token_count"]
+        records[-1:-1] = [
+            self.token_count("2026-07-20T10:00:04Z", first_last, first_total),
+            # Codex re-emits the identical snapshot when only rate limits refresh.
+            self.token_count("2026-07-20T10:00:05Z", first_last, first_total),
+            self.token_count("2026-07-20T10:00:06Z", second_last, second_total),
+        ]
+        path = self.write_rollout(records)
+        try:
+            turn = monitoring.create_analyzer(path).analysis.prompts[0]
+            self.assertEqual(turn.main.requests, 2)
+            self.assertEqual(len(turn.requests), 2)
+            self.assertEqual(turn.main.context_total, 140)
+            self.assertEqual(turn.main.cache_read, 100)
+            self.assertEqual(turn.main.output, 8)
+        finally:
+            os.unlink(path)
+
+    def test_dedup_baseline_survives_cache_resume(self):
+        last = {"input_tokens": 100, "cached_input_tokens": 70, "output_tokens": 5, "total_tokens": 105}
+        records = [item for item in codex_records() if item["payload"].get("type") != "token_count"]
+        records[-1:-1] = [self.token_count("2026-07-20T10:00:04Z", last, dict(last))]
+        path = self.write_rollout(records)
+        cache_file = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+        cache_file.close()
+        try:
+            cache = monitoring.ProfilerCache(cache_file.name)
+            cache.analyzer(path)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(self.token_count("2026-07-20T10:00:07Z", last, dict(last))) + "\n")
+            resumed = cache.analyzer(path)
+            self.assertEqual(resumed.analysis.prompts[0].main.requests, 1)
+            cache.db.close()
+        finally:
+            os.unlink(path)
+            os.unlink(cache_file.name)
+
+
+def small_overall_report(session_count=1):
+    usage = monitoring.Usage()
+    usage.add("claude-fable", 10, 5, 0, 100)
+    project = monitoring.ProjectUsage("tools", usage=usage, sessions=session_count, prompts=1, root="/work/tools")
+    return monitoring.OverallReport(
+        total=usage, projects=[project], provider_usage={"claude": usage},
+        provider_sessions=monitoring.Counter(claude=session_count), session_count=session_count,
+        discovered_count=session_count, prompt_count=1, unreadable=0, days=[],
+    )
+
+
+class DetachedDashboardTests(unittest.TestCase):
+    def test_exported_report_stays_script_free(self):
+        exported = monitoring.render_overall_html(small_overall_report(), "now")
+        self.assertNotIn("<script", exported)
+        self.assertNotIn("https://", exported)
+
+    def test_report_payload_carries_per_day_providers_models_and_every_session(self):
+        report = small_overall_report(session_count=2)
+        day = monitoring.DayUsage("2026-07-20")
+        day.usage.add("claude-fable", 10, 5, 0, 100)
+        day.providers["claude"] = monitoring.Usage()
+        day.providers["claude"].add("claude-fable", 10, 5, 0, 100)
+        report.days.append(day)
+        report.sessions.append(monitoring.SessionUsage(
+            "sess-1", "", 1, "Run review", "2026-07-20T10:00:00+00:00", "claude", report.total,
+            1, 110, 110, 90.9, "/tmp/sess-1.jsonl", "/work/tools",
+        ))
+        payload = monitoring.report_payload(report, "now", 4)
+        self.assertEqual(payload["version"], 4)
+        self.assertEqual(payload["weights"], {"fresh": 1.0, "cache": 0.1})
+        self.assertEqual(payload["days"][0]["providers"]["claude"]["cache_read"], 100)
+        self.assertEqual(payload["days"][0]["usage"]["models"]["claude-fable"]["cache"], 100)
+        self.assertEqual(payload["sessions"][0]["id"], "sess-1")
+        self.assertEqual(payload["sessions"][0]["project"], "tools")
+        self.assertEqual(payload["total"]["consumption"], 15 + 10)
+        self.assertEqual(json.loads(json.dumps(payload))["scope"]["sessions"], 2)
+
+    def test_dashboard_serves_report_session_and_prompt_detail(self):
+        import urllib.error
+        import urllib.request
+
+        first = prompt()
+        first["sessionId"] = "abcd1234-0000-0000-0000-000000000001"
+        fixture = SessionFixture([first, request_with_actor()])
+        html_file = tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8")
+        html_file.write("<!doctype html><title>test page</title><p>spa</p>")
+        html_file.close()
+        rebuilt = small_overall_report(session_count=7)
+        rebuilt.sessions.append(monitoring.SessionUsage(
+            first["sessionId"], "", 1, "Run review", "2026-07-20T10:00:00+00:00", "claude",
+            rebuilt.total, 1, 0, 0, 0.0, fixture.path, "/work/tools",
+        ))
+        server = monitoring.DashboardServer(
+            None, initial=small_overall_report(), refresh_seconds=3600,
+            build=lambda cache, progress=None: rebuilt, html_path=Path(html_file.name),
+        )
+        url = server.start()
+        try:
+            self.assertTrue(url.startswith("http://127.0.0.1:"))
+            with urllib.request.urlopen(url) as response:
+                self.assertIn("test page", response.read().decode("utf-8"))
+                self.assertEqual(response.headers["Cache-Control"], "no-store")
+            with urllib.request.urlopen(url + "api/report") as response:
+                self.assertEqual(json.loads(response.read())["version"], 1)
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(url + "api/session/" + first["sessionId"])
+            self.assertEqual(caught.exception.code, 404)
+
+            self.assertTrue(server.rebuild())
+            with urllib.request.urlopen(url + "api/status") as response:
+                status = json.loads(response.read())
+            self.assertEqual((status["version"], status["sessions"], status["ready"]), (2, 7, True))
+            with urllib.request.urlopen(url + "api/session/" + first["sessionId"]) as response:
+                session = json.loads(response.read())
+            self.assertEqual(session["provider"], "claude")
+            self.assertEqual(len(session["prompts"]), 1)
+            self.assertEqual(session["prompts"][0]["prompt"], "Run review")
+            self.assertEqual(session["prompts"][0]["requests"], 1)
+            with urllib.request.urlopen(url + "api/session/" + first["sessionId"] + "/prompt/1") as response:
+                detail = json.loads(response.read())
+            self.assertEqual(detail["position"], 1)
+            self.assertEqual(len(detail["requests"]), 1)
+            self.assertEqual(len(detail["actors"]), 1)
+            self.assertTrue(detail["timeline"])
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(url + "api/session/" + first["sessionId"] + "/prompt/9")
+            self.assertEqual(caught.exception.code, 404)
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(url + "nope")
+            self.assertEqual(caught.exception.code, 404)
+        finally:
+            server.stop()
+            fixture.close()
+            os.unlink(html_file.name)
+        self.assertFalse(server.running)
+        with self.assertRaises(urllib.error.URLError):
+            urllib.request.urlopen(url, timeout=1)
+
+    def test_failed_rebuild_keeps_previous_report_and_reports_error(self):
+        def explode(cache, progress=None):
+            raise RuntimeError("disk on fire")
+
+        server = monitoring.DashboardServer(None, initial=small_overall_report(), refresh_seconds=3600, build=explode)
+        self.assertFalse(server.rebuild())
+        status = server.status()
+        self.assertEqual(status["version"], 1)
+        self.assertEqual(status["error"], "disk on fire")
+        self.assertEqual(server.report["scope"]["sessions"], 1)
+
+    def test_d_detaches_current_view_from_any_mode_and_D_stops(self):
+        first = prompt()
+        first["sessionId"] = "abcd1234-0000-0000-0000-000000000002"
+        fixture = SessionFixture([first, assistant_usage()])
+
+        class Screen:
+            def getmaxyx(self):
+                return 24, 120
+
+        try:
+            with mock.patch.dict(os.environ, {"AGENT_MONITOR_NO_BROWSER": "1"}):
+                app = monitoring.TTYApp(Screen(), fixture.path)
+                app.refresh(force=True)
+                app.handle_key(ord("D"))
+                self.assertIn("No dashboard running", app.transient_status)
+
+                app.handle_key(ord("d"))
+                self.assertIsNotNone(app.dashboard)
+                self.assertTrue(app.dashboard.running)
+                self.assertIn("#/session/" + first["sessionId"], app.transient_status)
+                self.assertIn("building report in the background", app.transient_status)
+                self.assertIn("browser opening disabled", app.transient_status)
+                self.assertFalse(app.dashboard.status()["ready"])
+                app.dashboard.on_publish(1)
+                self.assertTrue(app.transient_status.startswith("Dashboard ready · http://127.0.0.1:"))
+
+                app.mode = "detail"
+                app.selected_prompt = 1
+                app.detail_page = "request:0"
+                self.assertEqual(app.detach_route(), f"#/session/{first['sessionId']}/prompt/1/request/1")
+                app.mode = "overall"
+                self.assertEqual(app.detach_route(), "#/overview")
+                app.mode = "project"
+                self.assertEqual(app.detach_route(), "#/projects")
+                server = app.dashboard
+                app.handle_key(ord("d"))
+                self.assertIs(app.dashboard, server)
+                self.assertIn("#/projects", app.transient_status)
+
+                app.handle_key(ord("D"))
+                self.assertIsNone(app.dashboard)
+                self.assertFalse(server.running)
+                self.assertEqual(app.transient_status, "Dashboard stopped")
+        finally:
+            fixture.close()

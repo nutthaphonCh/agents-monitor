@@ -15,6 +15,8 @@ Keys
   o / O       Overall consumption page
   p           background processes for the current session; on the Overall
               page, p/P instead exports a self-contained shareable HTML report
+  d / D       detach the current view to a browser dashboard served on
+              127.0.0.1 only (any page) / stop that dashboard
   Up / Down   move between prompts
   Right/Enter open; Left/Esc back
   PgUp/PgDn   scroll one page
@@ -36,6 +38,7 @@ No dependencies — Python 3 standard library only.
 from __future__ import annotations
 
 import argparse
+import copy
 import curses
 import datetime as dt
 import glob
@@ -54,12 +57,13 @@ import unicodedata
 
 from collections import Counter
 from dataclasses import dataclass, field, fields, is_dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 
 
 REFRESH_INTERVAL = 0.5
-CACHE_SCHEMA_VERSION = 12
+CACHE_SCHEMA_VERSION = 13
 ESCAPE_DELAY_MS = 25
 ACTION_NAMES = (
     "WebSearch", "WebFetch", "Bash", "Write", "Edit", "Read", "Glob", "Grep", "Search",
@@ -273,6 +277,9 @@ class PromptTurn:
     usage_observations: list[UsageObservation] = field(default_factory=list)
     accounted_usage_keys: set[str] = field(default_factory=set, repr=False)
     request_info_keys: set[str] = field(default_factory=set, repr=False)
+    # Claude Code stamps every record of a turn, and the first record of each spawned
+    # subagent transcript, with the same ``promptId``; it links the two files.
+    prompt_id: str | None = None
 
     @property
     def total_usage(self) -> Usage:
@@ -321,6 +328,7 @@ class SessionUsage:
     peak_context: int = 0
     cache_hit_rate: float = 0.0
     path: str = ""
+    project_root: str = ""
 
 
 @dataclass
@@ -339,6 +347,8 @@ class ProjectUsage:
 class DayUsage:
     day: str
     usage: Usage = field(default_factory=Usage)
+    # Per-provider split of the same day, so a trend can stack claude/codex bars.
+    providers: dict[str, Usage] = field(default_factory=dict)
 
 
 @dataclass
@@ -354,6 +364,9 @@ class OverallReport:
     unreadable: int
     days: list[DayUsage]
     window_days: int = OVERALL_WINDOW_DAYS
+    # Every analyzed session in the window (not only each project's recent top list),
+    # newest first — the detached dashboard browses sessions from this.
+    sessions: list[SessionUsage] = field(default_factory=list)
 
     @property
     def excluded_old(self) -> int:
@@ -830,6 +843,7 @@ def analyze(path: str) -> Analysis:
                     prompt=prompt_text(rec),
                     start_sequence=sequence,
                     timestamp=rec.get("timestamp"),
+                    prompt_id=rec.get("promptId") or None,
                 )
                 prompts.append(current)
                 continue
@@ -1386,6 +1400,32 @@ def enrich_analysis(path: str, analysis: Analysis) -> dict[str, tuple[PromptTurn
     return tools
 
 
+SUBAGENT_DIR_NAME = "subagents"
+
+
+def subagent_directory(path: str) -> Path:
+    """Claude Code keeps the agents a session spawned under ``<session>/subagents/``.
+
+    Their transcripts are separate JSONL files (``agent-<id>.jsonl``, possibly nested under
+    ``workflows/``), so the parent transcript itself no longer carries ``isSidechain`` usage.
+    """
+    return Path(path).with_suffix("") / SUBAGENT_DIR_NAME
+
+
+def subagent_label(transcript_path: str, model: str) -> str:
+    """Prefer the sidecar ``agent-<id>.meta.json`` description over a model-only label."""
+    try:
+        meta = json.loads(Path(transcript_path).with_suffix(".meta.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        meta = None
+    if isinstance(meta, dict):
+        parts = [str(meta.get(key) or "").strip() for key in ("description", "agentType")]
+        label = " · ".join(part for part in parts if part)
+        if label:
+            return truncate(label, 80)
+    return f"{short_model(model)} sub-session"
+
+
 class IncrementalSessionAnalyzer:
     """Parse an existing session once, then consume only newly appended JSONL bytes."""
     def __init__(self, path: str) -> None:
@@ -1395,8 +1435,16 @@ class IncrementalSessionAnalyzer:
         self.offset = os.path.getsize(path)
         self.sequence = self.analysis.record_count
         self.partial = ""
+        # Per subagent transcript: consumed byte offset, trailing partial line, and the
+        # index of the prompt it was attributed to once its first record was read.
+        self.subagents: dict[str, dict[str, Any]] = {}
+        self._poll_subagents()
 
     def poll(self) -> bool:
+        changed = self._poll_main()
+        return self._poll_subagents() or changed
+
+    def _poll_main(self) -> bool:
         size = os.path.getsize(self.path)
         if size < self.offset:
             self.__init__(self.path)
@@ -1427,6 +1475,86 @@ class IncrementalSessionAnalyzer:
             changed = True
         return changed
 
+    def _poll_subagents(self) -> bool:
+        directory = subagent_directory(self.path)
+        if not directory.is_dir():
+            return False
+        changed = False
+        for transcript in sorted(directory.rglob("*.jsonl")):
+            key = str(transcript)
+            state = self.subagents.get(key)
+            if state is None:
+                state = self.subagents[key] = {
+                    "offset": 0, "partial": "", "prompt_index": None,
+                    "agent_id": transcript.stem.removeprefix("agent-"),
+                }
+            try:
+                size = os.path.getsize(key)
+            except OSError:
+                continue
+            if size < state["offset"]:
+                # Rewritten transcript: re-read it; request-id dedup keeps totals stable.
+                state["offset"], state["partial"] = 0, ""
+            if size == state["offset"]:
+                continue
+            with open(key, "r", encoding="utf-8") as fh:
+                fh.seek(state["offset"])
+                chunk = fh.read()
+                state["offset"] = fh.tell()
+            lines = (state["partial"] + chunk).splitlines(keepends=True)
+            state["partial"] = ""
+            if lines and not lines[-1].endswith(("\n", "\r")):
+                state["partial"] = lines.pop()
+            for line in lines:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    self.analysis.malformed += 1
+                    continue
+                if isinstance(rec, dict) and self._append_subagent_record(rec, key, state):
+                    changed = True
+        return changed
+
+    def _subagent_prompt(self, rec: dict[str, Any], state: dict[str, Any]) -> PromptTurn | None:
+        if state["prompt_index"] is not None:
+            return next((p for p in self.analysis.prompts if p.index == state["prompt_index"]), None)
+        prompts = self.analysis.prompts
+        if not prompts:
+            return None
+        prompt_id = rec.get("promptId")
+        match = next((p for p in prompts if prompt_id and p.prompt_id == prompt_id), None)
+        if match is None:
+            stamp = parse_iso_timestamp(rec.get("timestamp"))
+            if stamp:
+                started = [(parse_iso_timestamp(p.timestamp), p) for p in prompts]
+                match = next((p for at, p in reversed(started) if at and at <= stamp), None)
+        match = match or prompts[-1]
+        state["prompt_index"] = match.index
+        return match
+
+    def _append_subagent_record(self, rec: dict[str, Any], transcript: str, state: dict[str, Any]) -> bool:
+        prompt = self._subagent_prompt(rec, state)
+        usage_tuple = extract_usage(rec)
+        if not usage_tuple:
+            return False
+        model, inp, out, cache_create, cache_read = usage_tuple
+        usage = Usage()
+        usage.add(model, inp, out, cache_create, cache_read)
+        if prompt is None:
+            self.analysis.preamble.merge(usage)
+            return True
+        usage_key = usage_identity(rec)
+        if usage_key and usage_key in prompt.accounted_usage_keys:
+            return False
+        if usage_key:
+            prompt.accounted_usage_keys.add(usage_key)
+        key = f"agentId:{state['agent_id']}"
+        sub = prompt.sub_sessions.get(key)
+        if sub is None:
+            sub = prompt.sub_sessions[key] = SubSession(key, subagent_label(transcript, model), prompt.start_sequence)
+        sub.usage.merge(usage)
+        return True
+
     def _append_record(self, rec: dict[str, Any]) -> None:
         if is_real_user_prompt(rec):
             previous = self.analysis.prompts[-1] if self.analysis.prompts else None
@@ -1435,7 +1563,10 @@ class IncrementalSessionAnalyzer:
                 for actor in self.analysis.prompts[-1].actors:
                     if actor.key == "main" and actor.status == "running":
                         actor.status = "completed"
-            prompt = PromptTurn(len(self.analysis.prompts) + 1, prompt_text(rec), self.sequence, rec.get("timestamp"))
+            prompt = PromptTurn(
+                len(self.analysis.prompts) + 1, prompt_text(rec), self.sequence, rec.get("timestamp"),
+                prompt_id=rec.get("promptId") or None,
+            )
             if previous:
                 prompt.evidence_chars.update(previous.evidence_chars)
             prompt.timeline.append(TimelineItem(rec.get("timestamp"), "Prompt started", "prompt"))
@@ -1552,6 +1683,9 @@ class CodexSessionAnalyzer:
         self.pending_action_outputs: list[str] = []
         self.pending_cells: dict[str, Actor] = {}
         self.base_evidence: Counter[str] = Counter()
+        # Cumulative usage of the last accepted token_count; Codex replays a snapshot
+        # verbatim (e.g. when only rate limits refresh), and that replay is not a request.
+        self.previous_total: dict[str, Any] | None = None
         self.poll()
 
     def poll(self) -> bool:
@@ -1717,6 +1851,11 @@ class CodexSessionAnalyzer:
             last = info.get("last_token_usage") if isinstance(info, dict) else None
             if not isinstance(last, dict):
                 return
+            total = info.get("total_token_usage")
+            if isinstance(total, dict):
+                if total == self.previous_total:
+                    return
+                self.previous_total = total
             total_input = int(last.get("input_tokens", 0) or 0)
             cached = int(last.get("cached_input_tokens", 0) or 0)
             output = int(last.get("output_tokens", 0) or 0)
@@ -1878,6 +2017,13 @@ class ProfilerCache:
                     if actor.status == "running" and actor.task_id
                 }
                 analyzer.base_evidence = Counter(state.get("base_evidence") or {})
+                previous_total = state.get("previous_total")
+                analyzer.previous_total = previous_total if isinstance(previous_total, dict) else None
+            else:
+                analyzer.subagents = {
+                    str(key): dict(item) for key, item in (state.get("subagents") or {}).items()
+                    if isinstance(item, dict)
+                }
             analyzer.tools = {}
             for tool_id, tool in state.get("tools", {}).items():
                 prompt = next((item for item in analysis.prompts if item.index == tool[0]), None)
@@ -1904,6 +2050,8 @@ class ProfilerCache:
             "pending_action_details": getattr(analyzer, "pending_action_details", []),
             "pending_action_outputs": getattr(analyzer, "pending_action_outputs", []),
             "base_evidence": dict(getattr(analyzer, "base_evidence", {})),
+            "previous_total": getattr(analyzer, "previous_total", None),
+            "subagents": getattr(analyzer, "subagents", {}),
         }, ensure_ascii=False, separators=(",", ":"))
         try:
             self.db.execute("""
@@ -2034,6 +2182,24 @@ def session_identifier(path: str) -> str:
     return Path(path).stem
 
 
+def resolve_session_path(reference: str, paths: list[str] | None = None) -> str | None:
+    """Resolve a logical session ID, rollout filename, or unique prefix to a session file."""
+    needle = reference.strip().removeprefix("#")
+    if not needle:
+        return None
+    exact: list[str] = []
+    prefix: list[str] = []
+    for path in (paths if paths is not None else find_all_sessions()):
+        logical_id = session_identifier(path)
+        rollout = Path(path).stem
+        identities = (logical_id, rollout, display_rollout_id(rollout))
+        if needle in identities:
+            exact.append(path)
+        elif any(value.startswith(needle) for value in identities):
+            prefix.append(path)
+    return (exact or prefix or [None])[0]
+
+
 def display_rollout_id(value: str) -> str:
     """Shorten UUIDs inside a rollout name for display; never use this as an identity."""
     return re.sub(
@@ -2095,7 +2261,8 @@ def build_overall_report(
     projects: dict[str, ProjectUsage] = {}
     provider_usage: dict[str, Usage] = {"claude": Usage(), "codex": Usage()}
     provider_sessions: Counter[str] = Counter()
-    days: dict[str, Usage] = {}
+    days: dict[str, DayUsage] = {}
+    all_sessions: list[SessionUsage] = []
     prompt_count = 0
     session_count = 0
     unreadable = 0
@@ -2153,14 +2320,16 @@ def build_overall_report(
         session_time = max(parsed_timestamps) if parsed_timestamps else dt.datetime.fromtimestamp(
             ordering_time, tz=dt.timezone.utc,
         )
+        label = all_prompts[0].prompt if all_prompts else Path(path).stem
+        latest_context, peak_context, cache_hit_rate = session_context_summary(analyses)
+        session_usage = SessionUsage(
+            session_identifier(path), Path(path).stem if provider == "codex" else "",
+            len(shard_paths), label, session_time.astimezone(local_tz).isoformat(), provider, usage,
+            len(all_prompts), latest_context, peak_context, cache_hit_rate, path, project_root,
+        )
+        all_sessions.append(session_usage)
         if usage.total and session_time >= recent_cutoff:
-            label = all_prompts[0].prompt if all_prompts else Path(path).stem
-            latest_context, peak_context, cache_hit_rate = session_context_summary(analyses)
-            project.recent_sessions.append(SessionUsage(
-                session_identifier(path), Path(path).stem if provider == "codex" else "",
-                len(shard_paths), label, session_time.astimezone(local_tz).isoformat(), provider, usage,
-                len(all_prompts), latest_context, peak_context, cache_hit_rate, path,
-            ))
+            project.recent_sessions.append(session_usage)
 
         for prompt_turn in all_prompts:
             prompt_usage = prompt_turn.total_usage
@@ -2170,7 +2339,9 @@ def build_overall_report(
                 if stamp.tzinfo is None:
                     stamp = stamp.replace(tzinfo=dt.timezone.utc)
                 day = stamp.astimezone(local_tz).date().isoformat()
-                days.setdefault(day, Usage()).merge(prompt_usage)
+                bucket = days.setdefault(day, DayUsage(day))
+                bucket.usage.merge(prompt_usage)
+                bucket.providers.setdefault(provider, Usage()).merge(prompt_usage)
         if progress:
             progress(index, len(scoped))
 
@@ -2186,8 +2357,9 @@ def build_overall_report(
         discovered_count=discovered_count,
         prompt_count=prompt_count,
         unreadable=unreadable,
-        days=[DayUsage(day, usage) for day, usage in sorted(days.items())],
+        days=[days[day] for day in sorted(days)],
         window_days=window_days,
+        sessions=sorted(all_sessions, key=lambda item: item.timestamp or "", reverse=True),
     )
 
 
@@ -2896,19 +3068,490 @@ def write_overall_report(report: OverallReport) -> tuple[bool, str]:
     return True, f"saved {path}"
 
 
-def open_overall_report(path: Path | None = None) -> tuple[bool, str]:
-    """Open an exported report without blocking the curses event loop."""
-    target = path or default_overall_report_path()
+def open_in_browser(target: str) -> tuple[bool, str]:
+    """Hand a file path or URL to the default browser without blocking the curses event loop.
+
+    Returns ``(ok, reason)``; ``reason`` is empty when the browser was actually asked to open it.
+    """
     if os.environ.get("AGENT_MONITOR_NO_BROWSER"):
-        return True, f"saved {target} · browser opening disabled"
+        return True, "browser opening disabled"
     try:
         subprocess.Popen(
-            ("open", str(target)), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ("open", target), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
     except OSError as exc:
-        return False, f"saved {target} · could not open browser: {exc}"
+        return False, f"could not open browser: {exc}"
+    return True, ""
+
+
+def open_overall_report(path: Path | None = None) -> tuple[bool, str]:
+    """Open an exported report without blocking the curses event loop."""
+    target = path or default_overall_report_path()
+    opened, reason = open_in_browser(str(target))
+    if reason:
+        return opened, f"saved {target} · {reason}"
     return True, f"opened in browser · {target}"
+
+
+DASHBOARD_HOST = "127.0.0.1"
+DASHBOARD_HTML_PATH = Path(__file__).resolve().with_name("dashboard.html")
+
+
+def dashboard_refresh_seconds() -> float:
+    return max(5.0, configured_weight("AGENT_MONITOR_DASHBOARD_REFRESH", 60.0))
+
+
+def usage_payload(usage: Usage) -> dict[str, Any]:
+    """JSON shape for a Usage: raw components plus the weighted score, never a price."""
+    return {
+        "input": usage.input, "output": usage.output,
+        "cache_create": usage.cache_create, "cache_read": usage.cache_read,
+        "total": usage.total, "fresh": usage.fresh, "context_total": usage.context_total,
+        "requests": usage.requests, "cache_hit_rate": round(usage.cache_hit_rate, 2),
+        "consumption": round(usage.consumption, 2),
+        "models": {
+            model: {
+                "requests": usage.models.get(model, 0),
+                "total": usage.model_totals.get(model, 0),
+                "fresh": usage.model_fresh.get(model, 0),
+                "cache": usage.model_cache.get(model, 0),
+                "consumption": round(usage.model_consumption.get(model, 0.0), 2),
+            }
+            for model in sorted(usage.model_totals.keys() | usage.models.keys())
+        },
+    }
+
+
+def session_usage_payload(item: SessionUsage) -> dict[str, Any]:
+    return {
+        "id": item.session_id, "rollout_id": item.rollout_id,
+        "display_id": display_rollout_id(item.rollout_id) if item.rollout_id else item.session_id,
+        "shards": item.rollout_count, "label": item.label, "timestamp": item.timestamp,
+        "provider": item.provider, "usage": usage_payload(item.usage), "prompts": item.prompt_count,
+        "latest_context": item.latest_context, "peak_context": item.peak_context,
+        "cache_hit_rate": round(item.cache_hit_rate, 2), "project_root": item.project_root,
+    }
+
+
+def report_payload(report: OverallReport, generated_at: str, version: int) -> dict[str, Any]:
+    """Everything the detached dashboard renders, derived from the same OverallReport the TUI shows."""
+    names = {project.root: project.name for project in report.projects}
+    return {
+        "version": version, "generated_at": generated_at,
+        "weights": {
+            "fresh": CONSUMPTION_CONFIG.fresh_weight, "cache": CONSUMPTION_CONFIG.cache_weight,
+        },
+        "window_days": report.window_days,
+        "scope": {
+            "sessions": report.session_count, "discovered": report.discovered_count,
+            "prompts": report.prompt_count, "unreadable": report.unreadable,
+            "excluded_old": report.excluded_old,
+        },
+        "total": usage_payload(report.total),
+        "providers": {
+            provider: {"usage": usage_payload(usage), "sessions": report.provider_sessions.get(provider, 0)}
+            for provider, usage in report.provider_usage.items()
+        },
+        "projects": [
+            {
+                "root": project.root, "name": project.name, "usage": usage_payload(project.usage),
+                "sessions": project.sessions, "prompts": project.prompts,
+                "files": [[path, count] for path, count in project.files.most_common(10)],
+            }
+            for project in report.projects
+        ],
+        "days": [
+            {
+                "day": day.day, "usage": usage_payload(day.usage),
+                "providers": {provider: usage_payload(usage) for provider, usage in day.providers.items()},
+            }
+            for day in report.days
+        ],
+        "sessions": [
+            {**session_usage_payload(item), "project": names.get(item.project_root, Path(item.project_root).name)}
+            for item in report.sessions
+        ],
+    }
+
+
+def prompt_status(prompt: PromptTurn, is_last: bool, session_is_live: bool) -> str:
+    if "Interrupted by user" in prompt.events:
+        return "interrupted"
+    if any(item.label == "Prompt completed" for item in prompt.timeline):
+        return "completed"
+    if is_last:
+        return "running" if session_is_live else "last observed"
+    return "completed"
+
+
+def prompt_summary_payload(prompt: PromptTurn, position: int, shard: str, status: str) -> dict[str, Any]:
+    usage = prompt.total_usage
+    return {
+        "position": position, "index": prompt.index, "shard": shard, "prompt": prompt.prompt,
+        "timestamp": prompt.timestamp, "status": status,
+        "latest_context": latest_context_size(prompt),
+        "latest_cache_hit_rate": round(latest_context_usage(prompt).cache_hit_rate, 2),
+        "usage": usage_payload(usage), "requests": len(prompt.requests),
+        "actors": len(prompt.actors) + (1 if prompt.main.total else 0),
+        "files": len(prompt.files), "events": list(prompt.events),
+        "sub_sessions": len(prompt.sub_sessions),
+    }
+
+
+def actor_payload(actor: Actor) -> dict[str, Any]:
+    started = parse_iso_timestamp(actor.started_at)
+    finished = parse_iso_timestamp(actor.finished_at)
+    return {
+        "key": actor.key, "label": actor.label, "status": actor.status,
+        "started_at": actor.started_at, "finished_at": actor.finished_at,
+        "elapsed_seconds": (finished - started).total_seconds() if started and finished else None,
+        "task_id": actor.task_id, "exit_code": actor.exit_code, "tool_use_id": actor.tool_use_id,
+        "working_dir": actor.working_dir, "thread_id": actor.thread_id,
+        "duration_seconds": actor.duration_seconds, "token_usage": dict(actor.token_usage),
+        "rate_limits": actor.rate_limits, "engine": actor.engine, "model": actor.model,
+        "mode": actor.mode, "lane": actor.lane, "verdict": actor.verdict,
+        "decision": actor.decision, "rationale": actor.rationale,
+    }
+
+
+def prompt_detail_payload(prompt: PromptTurn, position: int, shard: str, status: str) -> dict[str, Any]:
+    """The full prompt detail the terminal shows across its Actors/Timeline/Files/Requests pages."""
+    summary = prompt_summary_payload(prompt, position, shard, status)
+    timestamps = [value for value in (parse_iso_timestamp(item.timestamp) for item in prompt.timeline) if value]
+    summary.update({
+        "duration_seconds": max(0, round((timestamps[-1] - timestamps[0]).total_seconds())) if timestamps else None,
+        "main_actor": main_actor_name(prompt) if prompt.main.total else None,
+        "main": usage_payload(prompt.main),
+        "sub_sessions": [
+            {"key": sub.key, "label": sub.label, "usage": usage_payload(sub.usage)}
+            for sub in prompt.sub_sessions.values()
+        ],
+        "actors": [actor_payload(actor) for actor in prompt.actors],
+        "timeline": [
+            {"timestamp": item.timestamp, "label": item.label, "kind": item.kind} for item in prompt.timeline
+        ],
+        "files": [
+            {"timestamp": item.timestamp, "action": item.action, "path": item.path} for item in prompt.files
+        ],
+        "requests": [
+            {
+                "index": index, "timestamp": request.timestamp, "model": request.model,
+                "usage": usage_payload(request.usage), "stop_reason": request.stop_reason,
+                "actions": list(request.actions), "action_details": list(request.action_details),
+                "action_outputs": list(request.action_outputs),
+            }
+            for index, request in enumerate(prompt.requests, 1)
+        ],
+        "context": [[name, value] for name, value in context_attribution(prompt)],
+        "usage_observations": [
+            {
+                "before_time": item.before_time, "after_time": item.after_time,
+                "before_5h": item.before_5h, "after_5h": item.after_5h,
+                "before_weekly": item.before_weekly, "after_weekly": item.after_weekly,
+                "delta_5h": item.delta_5h, "delta_weekly": item.delta_weekly,
+                "confidence": item.confidence, "confidence_reason": item.confidence_reason,
+            }
+            for item in prompt.usage_observations
+        ],
+    })
+    return summary
+
+
+def load_session_analyses(path: str, cache: ProfilerCache | None) -> list[tuple[str, Analysis]]:
+    """(shard stem, analysis) for every rollout shard of a logical session, chronologically."""
+    shard_paths = codex_rollout_shards(path) if session_provider(path) == "codex" else [path]
+    analyses = []
+    for shard_path in shard_paths:
+        analyzer = cache.analyzer(shard_path) if cache else create_analyzer(shard_path)
+        analyses.append((Path(shard_path).stem, analyzer.analysis))
+    return analyses
+
+
+def merged_session_analysis(
+    path: str, cache: ProfilerCache | None = None,
+    current_analyzer: IncrementalSessionAnalyzer | CodexSessionAnalyzer | None = None,
+) -> Analysis:
+    """Return one TUI analysis spanning every shard of a logical Codex session.
+
+    Codex can continue one user-facing thread in multiple rollout files. Keep the
+    physical analyzer for the selected/current file incremental, but present deep
+    copies of all shard prompts with session-wide indices so navigation and detail
+    lookup cannot collide on each shard's local ``1..N`` numbering.
+    """
+    if session_provider(path) != "codex":
+        analyzer = current_analyzer or (cache.analyzer(path) if cache else create_analyzer(path))
+        return analyzer.analysis
+
+    prompts: list[PromptTurn] = []
+    preamble = Usage()
+    malformed = 0
+    record_count = 0
+    for shard_path in codex_rollout_shards(path):
+        if current_analyzer is not None and Path(shard_path).resolve() == Path(path).resolve():
+            analysis = current_analyzer.analysis
+        else:
+            analyzer = cache.analyzer(shard_path) if cache else create_analyzer(shard_path)
+            analysis = analyzer.analysis
+        preamble.merge(analysis.preamble)
+        malformed += analysis.malformed
+        record_count += analysis.record_count
+        for source_prompt in analysis.prompts:
+            prompt = copy.deepcopy(source_prompt)
+            prompt.index = len(prompts) + 1
+            prompts.append(prompt)
+    return Analysis(path, prompts, preamble, malformed, record_count, provider="codex")
+
+
+def session_detail_payload(path: str, cache: ProfilerCache | None, prompt_position: int | None = None) -> dict[str, Any]:
+    """Session summary with one row per prompt, or (with ``prompt_position``) one prompt in full."""
+    analyses = load_session_analyses(path, cache)
+    last_path = analyses[-1][1].path
+    session_is_live = time.time() - os.path.getmtime(last_path) < 2
+    flattened = [(shard, prompt) for shard, analysis in analyses for prompt in analysis.prompts]
+    prompts = []
+    for position, (shard, prompt) in enumerate(flattened, 1):
+        status = prompt_status(prompt, position == len(flattened), session_is_live)
+        if prompt_position is not None:
+            if position == prompt_position:
+                return prompt_detail_payload(prompt, position, shard, status)
+            continue
+        prompts.append(prompt_summary_payload(prompt, position, shard, status))
+    if prompt_position is not None:
+        raise KeyError(prompt_position)
+    total = Usage()
+    preamble = Usage()
+    for _, analysis in analyses:
+        total.merge(analysis.total_usage)
+        preamble.merge(analysis.preamble)
+    latest_context, peak_context, cache_hit_rate = session_context_summary([analysis for _, analysis in analyses])
+    provider = session_provider(path)
+    rollout = Path(path).stem if provider == "codex" else ""
+    return {
+        "id": session_identifier(path), "rollout_id": rollout,
+        "display_id": display_rollout_id(rollout) if rollout else session_identifier(path),
+        "provider": provider, "paths": [analysis.path for _, analysis in analyses],
+        "project_root": session_project_root(path), "live": session_is_live,
+        "usage": usage_payload(total), "preamble": usage_payload(preamble),
+        "latest_context": latest_context, "peak_context": peak_context,
+        "cache_hit_rate": round(cache_hit_rate, 2),
+        "malformed": sum(analysis.malformed for _, analysis in analyses),
+        "prompts": prompts,
+    }
+
+
+class DashboardServer:
+    """Serve the detached dashboard on loopback and keep its report fresh in the background.
+
+    ``d`` in the TUI detaches the current view into a browser. The page is ``dashboard.html``
+    next to this file: one self-contained page that renders ``/api/report`` (the same
+    ``OverallReport`` the TUI shows) and browses sessions through ``/api/session/<id>`` and
+    ``/api/session/<id>/prompt/<n>`` exactly the way the terminal does. Nothing leaves the
+    host: the socket binds 127.0.0.1 only and the page requests nothing but that socket.
+    """
+    def __init__(
+        self, cache_path: str | None, initial: OverallReport | None = None,
+        refresh_seconds: float | None = None,
+        build: Callable[..., OverallReport] | None = None,
+        html_path: Path | None = None,
+        on_publish: Callable[[int], None] | None = None,
+    ) -> None:
+        self.cache_path = cache_path
+        self.refresh_seconds = refresh_seconds if refresh_seconds is not None else dashboard_refresh_seconds()
+        self.build = build or build_overall_report
+        self.html_path = html_path or DASHBOARD_HTML_PATH
+        self.on_publish = on_publish
+        self.progress = (0, 0)
+        self.lock = threading.Lock()
+        self.version = 0
+        self.generated_at = ""
+        self.report: dict[str, Any] | None = None
+        self.session_paths: dict[str, str] = {}
+        self.session_count = 0
+        self.refreshing = False
+        self.error = ""
+        self.stop_event = threading.Event()
+        self.server: ThreadingHTTPServer | None = None
+        self.threads: list[threading.Thread] = []
+        if initial is not None:
+            self.publish(initial)
+
+    @property
+    def url(self) -> str:
+        if self.server is None:
+            return ""
+        return f"http://{DASHBOARD_HOST}:{self.server.server_address[1]}/"
+
+    @property
+    def running(self) -> bool:
+        return self.server is not None and not self.stop_event.is_set()
+
+    def page_html(self) -> str:
+        try:
+            return self.html_path.read_text(encoding="utf-8")
+        except OSError:
+            return (
+                "<!doctype html><meta charset=\"utf-8\"><title>agent-monitor</title>"
+                f"<p>dashboard.html is missing next to {html.escape(str(Path(__file__).resolve()))}; "
+                "the JSON API at /api/report is still available.</p>"
+            )
+
+    def publish(self, report: OverallReport) -> int:
+        generated_at = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        with self.lock:
+            self.version += 1
+            self.generated_at = generated_at
+            self.session_count = report.session_count
+            self.report = report_payload(report, generated_at, self.version)
+            self.session_paths = {item.session_id: item.path for item in report.sessions}
+            for item in report.sessions:
+                if item.rollout_id:
+                    self.session_paths.setdefault(item.rollout_id, item.path)
+                    self.session_paths.setdefault(display_rollout_id(item.rollout_id), item.path)
+            version = self.version
+        if self.on_publish is not None:
+            self.on_publish(version)
+        return version
+
+    def status(self) -> dict[str, Any]:
+        with self.lock:
+            return {
+                "version": self.version, "ready": self.version > 0, "generated_at": self.generated_at,
+                "sessions": self.session_count, "refreshing": self.refreshing,
+                "progress": list(self.progress),
+                "refresh_seconds": self.refresh_seconds, "error": self.error,
+            }
+
+    def rebuild(self) -> bool:
+        self.refreshing = True
+        self.progress = (0, 0)
+        background: ProfilerCache | None = None
+
+        def update_progress(done: int, total: int) -> None:
+            self.progress = (done, total)
+
+        try:
+            if self.cache_path:
+                background = ProfilerCache(self.cache_path)
+            report = self.build(background, progress=update_progress)
+        except Exception as exc:  # keep the previous report; surface the failure in /api/status
+            self.error = str(exc)
+            return False
+        finally:
+            if background is not None:
+                background.db.close()
+            self.refreshing = False
+        self.error = ""
+        self.publish(report)
+        return True
+
+    def _refresh_loop(self) -> None:
+        if self.version == 0 and not self.stop_event.is_set():
+            self.rebuild()
+        while not self.stop_event.wait(self.refresh_seconds):
+            self.rebuild()
+
+    def resolve_session(self, reference: str) -> str | None:
+        with self.lock:
+            known = self.session_paths.get(reference)
+        if known and Path(known).is_file():
+            return known
+        return resolve_session_path(reference)
+
+    def session_payload(self, reference: str, prompt_position: int | None = None) -> dict[str, Any] | None:
+        path = self.resolve_session(reference)
+        if not path:
+            return None
+        cache: ProfilerCache | None = None
+        try:
+            if self.cache_path:
+                cache = ProfilerCache(self.cache_path)
+            return session_detail_payload(path, cache, prompt_position)
+        finally:
+            if cache is not None:
+                cache.db.close()
+
+    def _handler_class(self) -> type[BaseHTTPRequestHandler]:
+        dashboard = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_: Any) -> None:
+                pass  # curses owns the terminal; never write request logs to it
+
+            def send_json(self, payload: Any, status: int = 200) -> None:
+                self.send_body(json.dumps(payload, ensure_ascii=False).encode("utf-8"), "application/json", status)
+
+            def send_body(self, body: bytes, content_type: str, status: int = 200) -> None:
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self) -> None:
+                route = self.path.split("?", 1)[0]
+                if route in ("/", "/index.html"):
+                    self.send_body(dashboard.page_html().encode("utf-8"), "text/html; charset=utf-8")
+                    return
+                if route == "/api/status":
+                    self.send_json(dashboard.status())
+                    return
+                if route == "/api/report":
+                    with dashboard.lock:
+                        report = dashboard.report
+                    if report is None:
+                        self.send_json({"error": "report not built yet", **dashboard.status()}, 503)
+                    else:
+                        self.send_json(report)
+                    return
+                parts = [part for part in route.split("/") if part]
+                if len(parts) in (3, 5) and parts[:2] == ["api", "session"] and (len(parts) == 3 or parts[3] == "prompt"):
+                    from urllib.parse import unquote
+                    reference = unquote(parts[2])
+                    position: int | None = None
+                    if len(parts) == 5:
+                        try:
+                            position = int(parts[4])
+                        except ValueError:
+                            self.send_json({"error": "bad prompt position"}, 400)
+                            return
+                    try:
+                        payload = dashboard.session_payload(reference, position)
+                    except KeyError:
+                        self.send_json({"error": f"prompt {position} not found"}, 404)
+                        return
+                    except (OSError, sqlite3.Error) as exc:
+                        self.send_json({"error": str(exc)}, 500)
+                        return
+                    if payload is None:
+                        self.send_json({"error": f"session {reference} not found"}, 404)
+                    else:
+                        self.send_json(payload)
+                    return
+                self.send_json({"error": "not found"}, 404)
+
+        return Handler
+
+    def start(self) -> str:
+        self.server = ThreadingHTTPServer((DASHBOARD_HOST, 0), self._handler_class())
+        self.server.daemon_threads = True
+        self.threads = [
+            threading.Thread(target=self.server.serve_forever, name="agent-monitor-dashboard", daemon=True),
+            threading.Thread(target=self._refresh_loop, name="agent-monitor-dashboard-refresh", daemon=True),
+        ]
+        for thread in self.threads:
+            thread.start()
+        return self.url
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.server is not None:
+            self.server.shutdown()
+            self.server.server_close()
+        # The refresh thread may be mid-build; it is a daemon and checks the stop flag afterwards.
+        if self.threads:
+            self.threads[0].join(timeout=2.0)
 
 
 def request_detail_lines(request: RequestInfo, index: int, width: int) -> list[str]:
@@ -3252,6 +3895,7 @@ class TTYApp:
         self.overall_load_total = 0
         self.overall_load_error = ""
         self.overall_thread: threading.Thread | None = None
+        self.dashboard: DashboardServer | None = None
         self.overall_project_cursor = 0
         self.project_session_cursor = 0
         self.selected_project = ""
@@ -3259,7 +3903,7 @@ class TTYApp:
         self.last_mtime = -1.0
         self.last_refresh = 0.0
         self.analyzer = cache.analyzer(path) if cache else create_analyzer(path)
-        self.analysis = self.analyzer.analysis
+        self.analysis = merged_session_analysis(path, cache, self.analyzer)
         self.last_record_count = self.analysis.record_count
         self.feed: list[tuple[int, str]] = []
         self.history: list[tuple[int, str]] = []
@@ -3291,7 +3935,7 @@ class TTYApp:
         self.path = self.session_paths[index]
         self.provider_positions[session_provider(self.path)] = self.path
         self.analyzer = self.cache.analyzer(self.path) if self.cache else create_analyzer(self.path)
-        self.analysis = self.analyzer.analysis
+        self.analysis = merged_session_analysis(self.path, self.cache, self.analyzer)
         self.last_record_count = self.analysis.record_count
         self.mode, self.follow, self.new_events = "list", True, 0
         self.cursor, self.offset = {1: 0, 2: 0}, {1: 0, 2: 0}
@@ -3334,7 +3978,7 @@ class TTYApp:
         self.path = target
         self.provider_positions[target_provider] = target
         self.analyzer = self.cache.analyzer(self.path) if self.cache else create_analyzer(self.path)
-        self.analysis = self.analyzer.analysis
+        self.analysis = merged_session_analysis(self.path, self.cache, self.analyzer)
         self.last_record_count = self.analysis.record_count
         self.mode, self.follow, self.new_events = "list", True, 0
         self.cursor, self.offset = {1: 0, 2: 0}, {1: 0, 2: 0}
@@ -3367,7 +4011,7 @@ class TTYApp:
         self.path = path
         self.provider_positions[target_provider] = path
         self.analyzer = self.cache.analyzer(path) if self.cache else create_analyzer(path)
-        self.analysis = self.analyzer.analysis
+        self.analysis = merged_session_analysis(path, self.cache, self.analyzer)
         self.last_record_count = self.analysis.record_count
         self.view, self.follow, self.new_events = 1, True, 0
         self.mode = "list"
@@ -3396,21 +4040,7 @@ class TTYApp:
 
     def find_session_path(self, reference: str) -> str | None:
         """Resolve a full logical session ID or rollout filename from the catalog."""
-        needle = reference.strip().removeprefix("#")
-        if not needle:
-            return None
-        paths = find_all_sessions()
-        exact: list[str] = []
-        prefix: list[str] = []
-        for path in paths:
-            logical_id = session_identifier(path)
-            rollout = Path(path).stem
-            identities = (logical_id, rollout, display_rollout_id(rollout))
-            if needle in identities:
-                exact.append(path)
-            elif any(value.startswith(needle) for value in identities):
-                prefix.append(path)
-        return (exact or prefix or [None])[0]
+        return resolve_session_path(reference)
 
     def selected_project_usage(self) -> ProjectUsage | None:
         if not self.overall_report:
@@ -3456,7 +4086,7 @@ class TTYApp:
                     changed = self.analyzer.poll()
                     if changed and self.cache:
                         self.cache.save(self.analyzer)
-                self.analysis = self.analyzer.analysis
+                self.analysis = merged_session_analysis(self.path, self.cache, self.analyzer)
                 self.feed = live_feed(self.analysis)
                 self.history = history_feed(self.analysis)
                 if self.search_query:
@@ -3657,6 +4287,57 @@ class TTYApp:
         opened, open_message = open_overall_report()
         self.set_status_area(message if opened else f"{message} · {open_message}")
 
+    def detach_route(self) -> str:
+        """Hash route of the view on screen, so ``d`` opens the browser at the same place."""
+        if self.mode in {"overall", "project"}:
+            return "#/projects" if self.mode == "project" else "#/overview"
+        session = session_identifier(self.path)
+        route = f"#/session/{session}"
+        if self.mode in {"detail", "processes", "process_detail"} or (
+            self.mode == "list" and not self.follow
+        ):
+            route += f"/prompt/{self.selected_prompt}"
+            if self.mode == "detail" and self.detail_page.startswith("request:"):
+                route += f"/request/{int(self.detail_page.split(':', 1)[1]) + 1}"
+            if session_provider(self.path) == "codex":
+                route += f"?shard={Path(self.path).stem}"
+        return route
+
+    def detach(self) -> None:
+        """Open the current view in the browser, starting the loopback dashboard if needed."""
+        started = False
+        if self.dashboard is None:
+            def announce_ready(version: int) -> None:
+                if version == 1 and self.dashboard is not None:
+                    self.set_status_area(f"Dashboard ready · {self.dashboard.url} · D stops", duration=0)
+
+            server = DashboardServer(
+                str(self.cache.path) if self.cache else None, initial=self.overall_report,
+                on_publish=announce_ready,
+            )
+            try:
+                server.start()
+            except OSError as exc:
+                self.set_status_area(f"detach failed: {exc}")
+                return
+            self.dashboard = server
+            started = True
+        url = self.dashboard.url + self.detach_route()
+        opened, reason = open_in_browser(url)
+        suffix = f" · {reason}" if reason else ""
+        building = started and self.dashboard.version == 0
+        state = "detached · building report in the background" if building else "detached"
+        self.set_status_area(f"{state} · {url} · D stops{suffix}", duration=0 if opened else 10.0)
+
+    def stop_dashboard(self, announce: bool = False) -> None:
+        if self.dashboard is not None:
+            self.dashboard.stop()
+            self.dashboard = None
+            if announce:
+                self.set_status_area("Dashboard stopped")
+        elif announce:
+            self.set_status_area("No dashboard running · d to detach")
+
     def handle_key(self, key: int | str) -> bool:
         text_key = key if isinstance(key, str) else ""
         if isinstance(key, str):
@@ -3687,6 +4368,12 @@ class TTYApp:
                 self.search_query += text_key
             elif 32 <= key <= 126:
                 self.search_query += chr(key)
+            return True
+        if key == ord("d"):
+            self.detach()
+            return True
+        if key == ord("D"):
+            self.stop_dashboard(announce=True)
             return True
         if key == ord("/") and self.mode in {"list", "overall", "project"}:
             self.begin_search()
@@ -4005,8 +4692,9 @@ class TTYApp:
                     rows.append((prefix + truncate_layout(line, width - len(prefix) - 1), attr))
             export_action = "p/P export + open" if self.overall_load_state == "ready" else "p/P after loading"
             footer = fit_action_bar(
-                f" OVERALL │ ↑/↓ project │ → open │ PgUp/PgDn scroll │ {export_action} │ r refresh │ ← back │ q quit",
-                f" OVERALL │ ↑/↓ project │ → open │ {export_action} │ ← back",
+                f" OVERALL │ ↑/↓ project │ → open │ PgUp/PgDn scroll │ {export_action} │ d detach"
+                " │ r refresh │ ← back │ q quit",
+                f" OVERALL │ ↑/↓ project │ → open │ {export_action} │ d detach │ ← back",
                 width,
             )
         elif self.mode == "project":
@@ -4037,8 +4725,9 @@ class TTYApp:
                 )
                 rows.append((("> " if selected else "  ") + truncate_terminal_layout(line, width - 3), attr))
             footer = fit_action_bar(
-                " PROJECT │ ↑/↓ session │ → jump │ / search or #id │ PgUp/PgDn scroll │ p/P export + open │ ← overall │ q quit",
-                " PROJECT │ ↑/↓ session │ → jump │ / search │ p export │ ← overall",
+                " PROJECT │ ↑/↓ session │ → jump │ / search or #id │ PgUp/PgDn scroll │ p/P export + open"
+                " │ d detach │ ← overall │ q quit",
+                " PROJECT │ ↑/↓ session │ → jump │ / search │ p export │ d detach │ ← overall",
                 width,
             )
         elif self.mode == "detail":
@@ -4119,6 +4808,7 @@ class TTYApp:
                 "x           Codex sessions",
                 "p           Spawned background agents for this session",
                 "o / O       Overall consumption page (all discovered sessions)",
+                "d / D       Detach this view to a loopback browser dashboard / stop it",
                 "/           Search current view",
                 "n / N       Next / previous search result",
                 "q           Quit",
@@ -4149,20 +4839,20 @@ class TTYApp:
                 ))
             if self.view == 1 and self.follow:
                 footer = fit_action_bar(
-                    " FOLLOW │ ↑/↓ prompt │ → open │ p processes │ o overall │ / search │ ? help │ q quit",
+                    " FOLLOW │ ↑/↓ prompt │ → open │ p processes │ o overall │ d detach │ / search │ ? help │ q quit",
                     " FOLLOW │ ↑/↓ │ → open │ p processes │ o overall │ / │ ? │ q",
                     width,
                 )
             elif self.view == 1:
                 updates = f"{self.new_events} updates │ " if self.new_events else ""
                 footer = fit_action_bar(
-                    f" PAUSED │ {updates}End follow │ ↑/↓ prompt │ → open │ p processes │ o overall │ / search │ ? help │ q quit",
+                    f" PAUSED │ {updates}End follow │ ↑/↓ prompt │ → open │ p processes │ o overall │ d detach │ / search │ ? help │ q quit",
                     f" PAUSED │ {updates}End follow │ → open │ p processes │ o overall │ / │ ? │ q",
                     width,
                 )
             else:
                 footer = fit_action_bar(
-                    " HISTORY │ ↑/↓ prompt │ → open │ p processes │ o overall │ / search │ ? help │ q quit",
+                    " HISTORY │ ↑/↓ prompt │ → open │ p processes │ o overall │ d detach │ / search │ ? help │ q quit",
                     " HISTORY │ ↑/↓ │ → open │ p processes │ o overall │ / │ ? │ q",
                     width,
                 )
@@ -4233,15 +4923,18 @@ class TTYApp:
         self.screen.timeout(100)
         self.screen.keypad(True)
         self.refresh(force=True)
-        while True:
-            self.refresh()
-            self.draw()
-            try:
-                key = self.screen.get_wch()
-            except curses.error:
-                continue
-            if not self.handle_key(key):
-                break
+        try:
+            while True:
+                self.refresh()
+                self.draw()
+                try:
+                    key = self.screen.get_wch()
+                except curses.error:
+                    continue
+                if not self.handle_key(key):
+                    break
+        finally:
+            self.stop_dashboard()
 
 
 def print_session_list(limit: int) -> None:

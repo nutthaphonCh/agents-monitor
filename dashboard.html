@@ -1,0 +1,476 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agent-monitor</title>
+<style>
+:root {
+  --bg: #0b1017; --panel: #121a24; --panel-2: #182231; --line: #223044; --text: #e6edf3; --muted: #8b9bb0;
+  --accent: #6cb4ee; --claude: #e0956b; --codex: #5fb5b0; --ok: #7bc96f; --warn: #e5c07b; --bad: #e06c75;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 var(--sans); }
+a { color: var(--accent); text-decoration: none; }
+button, select, input { font: inherit; color: inherit; }
+header { position: sticky; top: 0; z-index: 5; background: rgba(11,16,23,.94); border-bottom: 1px solid var(--line); backdrop-filter: blur(6px); }
+.bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 10px 18px; }
+.brand { font-family: var(--mono); font-weight: 600; letter-spacing: .04em; margin-right: 6px; }
+.tabs { display: flex; gap: 4px; }
+.tabs a, .seg button { padding: 5px 11px; border-radius: 7px; border: 1px solid transparent; color: var(--muted); background: transparent; cursor: pointer; }
+.tabs a.on, .seg button.on { color: var(--text); background: var(--panel-2); border-color: var(--line); }
+.seg { display: flex; gap: 2px; background: var(--panel); border: 1px solid var(--line); border-radius: 9px; padding: 2px; }
+.spacer { flex: 1; }
+.live { font-family: var(--mono); font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 7px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
+.dot.busy { background: var(--warn); animation: pulse 1s infinite alternate; }
+.dot.err { background: var(--bad); }
+@keyframes pulse { from { opacity: .3 } to { opacity: 1 } }
+main { max-width: 1280px; margin: 0 auto; padding: 18px; }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 22px 0 10px; }
+h2 .r { float: right; font-weight: 400; text-transform: none; letter-spacing: 0; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; }
+.tile { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+.tile .v { font-family: var(--mono); font-size: 22px; font-weight: 600; }
+.tile .l { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; margin-top: 2px; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+@media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; } }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+.row { display: grid; grid-template-columns: minmax(120px, 2fr) 5fr auto auto; gap: 10px; align-items: center; padding: 6px 4px; border-radius: 6px; cursor: default; }
+.row.sel, .srow.sel, .prow.sel, .rrow.sel { background: var(--panel-2); outline: 1px solid var(--line); }
+.row.click { cursor: pointer; }
+.row .n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.track { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
+.fill { height: 100%; border-radius: 3px; background: var(--accent); }
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; }
+.muted { color: var(--muted); }
+.sub[hidden] { display: none; }
+.sub { margin: 2px 4px 8px 20px; font-family: var(--mono); font-size: 12px; color: var(--muted); display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 4px 16px; }
+.heat { display: grid; grid-auto-flow: column; grid-template-rows: repeat(7, 12px); grid-auto-columns: 12px; justify-content: start; gap: 3px; overflow-x: auto; padding-bottom: 6px; }
+.heat i { width: 12px; height: 12px; border-radius: 2px; background: var(--line); display: block; }
+.heat i.l1 { background: #1d3b5a } .heat i.l2 { background: #2b5c8a } .heat i.l3 { background: #3f82bd } .heat i.l4 { background: #6cb4ee } .heat i.l5 { background: #a9d6f7 }
+.heat-lbl { display: flex; gap: 8px; font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 4px; }
+svg.chart { width: 100%; height: 320px; display: block; }
+.legend { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 4px 18px; margin-top: 8px; font-family: var(--mono); font-size: 12px; }
+.legend span.sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+.tools { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
+.tools input, .tools select { background: var(--panel); border: 1px solid var(--line); border-radius: 7px; padding: 5px 9px; }
+.tools input { min-width: 260px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; white-space: nowrap; }
+td.num, th.num { text-align: right; }
+tr.srow, tr.prow, tr.rrow { cursor: pointer; }
+tr.srow:hover, tr.prow:hover, tr.rrow:hover { background: var(--panel-2); }
+.tag { display: inline-block; font-family: var(--mono); font-size: 11px; padding: 1px 6px; border-radius: 5px; border: 1px solid var(--line); color: var(--muted); }
+.tag.claude { color: var(--claude); border-color: rgba(224,149,107,.4) }
+.tag.codex { color: var(--codex); border-color: rgba(95,181,176,.4) }
+.tag.running { color: var(--ok); border-color: rgba(123,201,111,.4) }
+.tag.interrupted { color: var(--bad); border-color: rgba(224,108,117,.4) }
+.tag.live { color: var(--ok); border-color: rgba(123,201,111,.5) }
+.crumbs { font-family: var(--mono); font-size: 12px; color: var(--muted); margin: 6px 0 12px; }
+.crumbs a { color: var(--accent); }
+.ptext { white-space: pre-wrap; word-break: break-word; }
+.kv { display: grid; grid-template-columns: 160px 1fr; gap: 3px 12px; font-family: var(--mono); font-size: 12.5px; }
+.kv b { color: var(--muted); font-weight: 500; }
+pre { background: #0a0e14; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; overflow-x: auto; font: 12.5px/1.4 var(--mono); white-space: pre-wrap; word-break: break-word; margin: 6px 0; }
+pre.cmd { color: #cfe3ff; }
+.subtabs { display: flex; flex-wrap: wrap; gap: 4px; margin: 10px 0; }
+.subtabs button { padding: 4px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--muted); cursor: pointer; }
+.subtabs button.on { color: var(--text); background: var(--panel-2); }
+.timeline li { font-family: var(--mono); font-size: 12.5px; list-style: none; padding: 2px 0; }
+.timeline { padding: 0; margin: 0; }
+.timeline .t { color: var(--muted); margin-right: 10px; }
+.empty { color: var(--muted); padding: 24px; text-align: center; }
+.hint { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 22px; }
+.copy { float: right; padding: 3px 9px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel-2); cursor: pointer; font-size: 12px; }
+details.proj { border-bottom: 1px solid var(--line); }
+details.proj summary { list-style: none; }
+details.proj summary::-webkit-details-marker { display: none; }
+.expand { margin: 6px 0 12px 12px; }
+.expand h3 { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin: 10px 0 4px; }
+footer { color: var(--muted); font-family: var(--mono); font-size: 11px; margin: 36px 0 12px; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <div class="bar">
+    <span class="brand">agent-monitor</span>
+    <nav class="tabs" id="tabs">
+      <a href="#/overview" data-tab="overview">Overview</a>
+      <a href="#/trends" data-tab="trends">Trends</a>
+      <a href="#/sessions" data-tab="sessions">Sessions</a>
+      <a href="#/projects" data-tab="projects">Projects</a>
+    </nav>
+    <span class="spacer"></span>
+    <div class="seg" id="range">
+      <button data-range="1">Today</button><button data-range="7">7d</button><button data-range="30">30d</button><button data-range="90">90d</button>
+    </div>
+    <div class="seg" id="unit">
+      <button data-unit="consumption">Consumption</button><button data-unit="raw">Raw tokens</button>
+    </div>
+    <div class="live" id="live"><span class="dot" id="dot"></span><span id="livetext">connecting…</span></div>
+  </div>
+</header>
+<main id="main"><div class="empty">Loading report…</div></main>
+<footer>agent-monitor detached dashboard · served on 127.0.0.1 only · keys: ↑/↓ or j/k select · ↵/→ open · ←/esc back · 1-4 tabs · / search · r refresh</footer>
+<script>
+(function () {
+  "use strict";
+  const $ = (sel, el) => (el || document).querySelector(sel);
+  const esc = (v) => String(v == null ? "" : v).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  const fmt = (v) => v >= 1e6 ? (v / 1e6).toFixed(2) + "M" : v >= 1e3 ? (v / 1e3).toFixed(1) + "K" : String(Math.round(v));
+  const fmtN = (v) => Math.round(v).toLocaleString();
+  const pct = (a, b) => b ? (a / b * 100) : 0;
+  const hm = (ts) => { if (!ts) return "--:--"; const d = new Date(ts); return isNaN(d) ? "--:--" : d.toTimeString().slice(0, 5); };
+  const dmy = (ts) => { if (!ts) return ""; const d = new Date(ts); return isNaN(d) ? ts : d.toLocaleDateString(undefined, {month: "short", day: "numeric"}) + " " + hm(ts); };
+  const localDay = (d) => { const y = d.getFullYear(), m = String(d.getMonth() + 1).padStart(2, "0"), day = String(d.getDate()).padStart(2, "0"); return `${y}-${m}-${day}`; };
+  const PALETTE = ["#6cb4ee", "#e0956b", "#5fb5b0", "#c678dd", "#e5c07b", "#7bc96f", "#e06c75", "#56b6c2", "#d19a66", "#98c379", "#61afef", "#be5046"];
+  const providerColor = { claude: "#e0956b", codex: "#5fb5b0" };
+
+  const state = {
+    report: null, version: 0, range: 30, unit: "consumption", route: null,
+    sel: 0, search: "", sort: "newest", provider: "all", detailTab: "requests",
+    sessions: {}, prompts: {}, expanded: {},
+  };
+  try { state.range = Number(localStorage.getItem("am.range")) || 30; state.unit = localStorage.getItem("am.unit") || "consumption"; } catch (e) {}
+
+  // ---------- data helpers
+  const uval = (u) => state.unit === "consumption" ? u.consumption : u.total;
+  const unitLabel = () => state.unit === "consumption" ? "consumption" : "tokens";
+  const mval = (m) => state.unit === "consumption" ? m.consumption : m.total;
+  function emptyUsage() { return {input: 0, output: 0, cache_create: 0, cache_read: 0, total: 0, fresh: 0, context_total: 0, requests: 0, consumption: 0, models: {}}; }
+  function mergeUsage(a, b) {
+    for (const k of ["input", "output", "cache_create", "cache_read", "total", "fresh", "context_total", "requests", "consumption"]) a[k] += b[k] || 0;
+    for (const [m, v] of Object.entries(b.models || {})) {
+      const t = a.models[m] || (a.models[m] = {requests: 0, total: 0, fresh: 0, cache: 0, consumption: 0});
+      for (const k of Object.keys(t)) t[k] += v[k] || 0;
+    }
+    return a;
+  }
+  function rangeDays() {
+    const out = []; const now = new Date();
+    for (let i = state.range - 1; i >= 0; i--) { const d = new Date(now); d.setDate(now.getDate() - i); out.push(localDay(d)); }
+    return out;
+  }
+  function daysInRange() { const keys = new Set(rangeDays()); return state.report.days.filter((d) => keys.has(d.day)); }
+  function sessionsInRange() {
+    const first = rangeDays()[0];
+    return state.report.sessions.filter((s) => s.timestamp && localDay(new Date(s.timestamp)) >= first);
+  }
+  function rangeTotals() {
+    const total = emptyUsage(); const providers = {};
+    for (const d of daysInRange()) {
+      mergeUsage(total, d.usage);
+      for (const [p, u] of Object.entries(d.providers)) mergeUsage(providers[p] || (providers[p] = emptyUsage()), u);
+    }
+    return {total, providers};
+  }
+
+  // ---------- routing
+  function parseRoute() {
+    const raw = location.hash.replace(/^#\/?/, "") || "overview";
+    const [path, query] = raw.split("?");
+    const parts = path.split("/").filter(Boolean);
+    const q = Object.fromEntries((query || "").split("&").filter(Boolean).map((kv) => kv.split("=").map(decodeURIComponent)));
+    if (parts[0] === "session" && parts[1]) {
+      return {view: "session", id: decodeURIComponent(parts[1]), prompt: parts[2] === "prompt" ? Number(parts[3]) : null,
+              request: parts[4] === "request" ? Number(parts[5]) : null, shard: q.shard || null};
+    }
+    return {view: ["overview", "trends", "sessions", "projects"].includes(parts[0]) ? parts[0] : "overview"};
+  }
+  function go(hash) { location.hash = hash; }
+  function backRoute() {
+    const r = state.route;
+    if (r.view !== "session") return null;
+    if (r.request) return `#/session/${encodeURIComponent(r.id)}/prompt/${r.prompt}`;
+    if (r.prompt) return `#/session/${encodeURIComponent(r.id)}`;
+    return "#/sessions";
+  }
+
+  // ---------- fetching
+  async function getJSON(url) { const res = await fetch(url, {cache: "no-store"}); if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText); return res.json(); }
+  async function loadReport() {
+    try { state.report = await getJSON("/api/report"); state.version = state.report.version; state.building = null; render(); }
+    catch (e) { state.building = state.building || {progress: [0, 0]}; render(); }
+  }
+  function buildingPanel() {
+    const [done, total] = (state.building && state.building.progress) || [0, 0];
+    const err = state.building && state.building.error;
+    return `<div class="panel" style="max-width:560px;margin:60px auto;text-align:center">
+      <div style="font-size:15px;margin-bottom:8px">${err ? "Report build failed" : "Building the report…"}</div>
+      <div class="muted" style="margin-bottom:12px">${err ? esc(err) : total ? `${done} of ${total} sessions analyzed` : "discovering sessions"}</div>
+      <div class="track" style="height:8px"><div class="fill" style="width:${total ? pct(done, total).toFixed(1) : 0}%"></div></div>
+      <div class="hint">the terminal keeps running · this page fills in by itself · sessions can be opened right away from <a href="#/sessions">the session list</a> once the report exists, or via a detached session link</div></div>`;
+  }
+  async function loadSession(id, force) {
+    if (!force && state.sessions[id]) return state.sessions[id];
+    return (state.sessions[id] = await getJSON(`/api/session/${encodeURIComponent(id)}`));
+  }
+  async function loadPrompt(id, pos, force) {
+    const key = id + "#" + pos;
+    if (!force && state.prompts[key]) return state.prompts[key];
+    return (state.prompts[key] = await getJSON(`/api/session/${encodeURIComponent(id)}/prompt/${pos}`));
+  }
+  async function poll() {
+    try {
+      const s = await getJSON("/api/status");
+      const dot = $("#dot"); dot.className = "dot" + (s.error ? " err" : s.refreshing ? " busy" : "");
+      const prog = s.refreshing && s.progress && s.progress[1] ? ` ${s.progress[0]}/${s.progress[1]}` : "";
+      $("#livetext").textContent = s.ready ? `v${s.version} · ${s.generated_at}${s.refreshing ? " · rebuilding" + prog : ""}${s.error ? " · " + s.error : ""}` : `building report${prog}…${s.error ? " · " + s.error : ""}`;
+      if (!s.ready) { state.building = {progress: s.progress || [0, 0], error: s.error}; if (state.route && state.route.view !== "session") render(); }
+      if (s.version !== state.version && s.version > 0) {
+        state.sessions = {}; state.prompts = {};
+        await loadReport();
+      } else if (state.route && state.route.view === "session" && state.sessions[state.route.id] && state.sessions[state.route.id].live) {
+        state.sessions = {}; state.prompts = {}; render();
+      }
+    } catch (e) { $("#dot").className = "dot err"; $("#livetext").textContent = "disconnected"; }
+  }
+
+  // ---------- views
+  function render() {
+    state.route = parseRoute();
+    document.querySelectorAll("#tabs a").forEach((a) => a.classList.toggle("on", a.dataset.tab === (state.route.view === "session" ? "sessions" : state.route.view)));
+    document.querySelectorAll("#range button").forEach((b) => b.classList.toggle("on", Number(b.dataset.range) === state.range));
+    document.querySelectorAll("#unit button").forEach((b) => b.classList.toggle("on", b.dataset.unit === state.unit));
+    const main = $("#main");
+    const v = state.route.view;
+    if (!state.report && v !== "session") { main.innerHTML = buildingPanel(); return; }
+    if (v === "overview") main.innerHTML = renderOverview();
+    else if (v === "trends") main.innerHTML = renderTrends();
+    else if (v === "sessions") main.innerHTML = renderSessions();
+    else if (v === "projects") main.innerHTML = renderProjects();
+    else if (v === "session") { main.innerHTML = `<div class="empty">Loading session…</div>`; renderSession().catch((e) => { main.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }); return; }
+    afterRender();
+  }
+  function afterRender() {
+    const rows = document.querySelectorAll("[data-idx]");
+    rows.forEach((r) => r.classList.toggle("sel", Number(r.dataset.idx) === state.sel));
+    const cur = document.querySelector("[data-idx].sel");
+    if (cur && cur.scrollIntoView) cur.scrollIntoView({block: "nearest"});
+  }
+  function bars(entries, color) {
+    const max = Math.max(...entries.map((e) => e.value), 0); const sum = entries.reduce((a, e) => a + e.value, 0);
+    return entries.map((e, i) => `
+      <div class="row${e.href ? " click" : ""}" ${e.href ? `data-href="${esc(e.href)}"` : ""} ${e.toggle ? `data-toggle="${esc(e.toggle)}"` : ""}>
+        <div class="n" title="${esc(e.label)}">${esc(e.label)}</div>
+        <div class="track"><div class="fill" style="width:${pct(e.value, max).toFixed(1)}%;background:${color ? color(e, i) : PALETTE[i % PALETTE.length]}"></div></div>
+        <div class="num">${fmt(e.value)}</div><div class="num muted">${pct(e.value, sum).toFixed(1)}%</div>
+      </div>${e.detail ? `<div class="sub" ${e.toggle ? `data-sub="${esc(e.toggle)}" ${state.expanded[e.toggle] ? "" : "hidden"}` : ""}>${e.detail}</div>` : ""}`).join("");
+  }
+  function modelRows(models) {
+    const entries = Object.entries(models).map(([m, v]) => ({label: m, value: mval(v), toggle: "m:" + m, detail:
+      `<span>fresh ${fmt(v.fresh)}</span><span>cache read ${fmt(v.cache)}</span><span>cache share ${pct(v.cache, v.total).toFixed(0)}%</span><span>requests ${v.requests}</span><span>consumption ${fmt(v.consumption)}</span>`}))
+      .filter((e) => e.value > 0).sort((a, b) => b.value - a.value);
+    return entries.length ? bars(entries) : `<div class="muted">No usage in range</div>`;
+  }
+
+  function renderOverview() {
+    const {total, providers} = rangeTotals();
+    const days = daysInRange().filter((d) => d.usage.total > 0);
+    const sessions = sessionsInRange();
+    const today = localDay(new Date()); const active = new Set(days.map((d) => d.day));
+    let streak = 0; { const d = new Date(); while (active.has(localDay(d))) { streak++; d.setDate(d.getDate() - 1); } }
+    const peak = days.reduce((a, d) => (!a || uval(d.usage) > uval(a.usage)) ? d : a, null);
+    const topModel = Object.entries(total.models).sort((a, b) => mval(b[1]) - mval(a[1]))[0];
+    const tiles = [
+      [fmt(uval(total)), state.unit === "consumption" ? "Consumption" : "Raw tokens"],
+      [fmt(state.unit === "consumption" ? total.total : total.consumption), state.unit === "consumption" ? "Raw tokens" : "Consumption"],
+      [String(sessions.length), "Sessions"], [fmtN(total.requests), "Requests"],
+      [String(days.length), "Active days"], [String(streak), "Current streak"],
+      [peak ? fmt(uval(peak.usage)) : "—", peak ? "Peak day · " + peak.day : "Peak day"],
+      [topModel ? topModel[0] : "—", "Top model"],
+      [pct(total.cache_read, total.context_total).toFixed(0) + "%", "Cache hit"], [fmt(total.output), "Output"],
+    ];
+    const provEntries = Object.entries(providers).map(([p, u]) => ({label: p, value: uval(u), detail:
+      `<span>sessions ${state.report.providers[p] ? state.report.providers[p].sessions : "?"}</span><span>cache hit ${pct(u.cache_read, u.context_total).toFixed(0)}%</span><span>output ${fmt(u.output)}</span><span>requests ${u.requests}</span>`, toggle: "p:" + p}))
+      .filter((e) => e.value > 0).sort((a, b) => b.value - a.value);
+    return `
+      <h2>Overview <span class="r">${esc(state.report.scope.sessions)} of ${esc(state.report.scope.discovered)} discovered sessions analyzed · last ${state.report.window_days} days on disk · today ${today}</span></h2>
+      <div class="tiles">${tiles.map(([v, l]) => `<div class="tile"><div class="v" title="${esc(v)}">${esc(v)}</div><div class="l">${esc(l)}</div></div>`).join("")}</div>
+      <h2>Activity <span class="r">${unitLabel()} per day</span></h2>
+      <div class="panel">${heatmap()}</div>
+      <div class="grid2">
+        <div><h2>By provider</h2><div class="panel">${provEntries.length ? bars(provEntries, (e) => providerColor[e.label] || PALETTE[0]) : '<div class="muted">No usage in range</div>'}</div></div>
+        <div><h2>By model <span class="r">click a row for cache split</span></h2><div class="panel">${modelRows(total.models)}</div></div>
+      </div>
+      <div class="hint">consumption = fresh × ${state.report.weights.fresh} + cache-read × ${state.report.weights.cache} · a comparison heuristic, not a price</div>`;
+  }
+  function heatmap() {
+    const byDay = Object.fromEntries(state.report.days.map((d) => [d.day, d]));
+    const keys = rangeDays(); const vals = keys.map((k) => byDay[k] ? uval(byDay[k].usage) : 0); const max = Math.max(...vals, 1);
+    const first = new Date(keys[0] + "T00:00:00"); const lead = (first.getDay() + 6) % 7;
+    const cells = []; for (let i = 0; i < lead; i++) cells.push(`<i style="visibility:hidden"></i>`);
+    keys.forEach((k, i) => { const v = vals[i]; const lvl = v <= 0 ? 0 : Math.min(5, Math.ceil(v / max * 5)); cells.push(`<i class="l${lvl}" title="${k} · ${fmt(v)} ${unitLabel()}"></i>`); });
+    return `<div class="heat">${cells.join("")}</div><div class="heat-lbl"><span>${keys[0]}</span><span>→</span><span>${keys[keys.length - 1]}</span><span class="spacer"></span><span>max ${fmt(max)}/day</span></div>`;
+  }
+
+  function renderTrends() {
+    const by = state.trendBy || "provider";
+    const byDay = Object.fromEntries(state.report.days.map((d) => [d.day, d]));
+    const keys = rangeDays();
+    const series = {}; const totals = {};
+    for (const k of keys) {
+      const d = byDay[k]; series[k] = {};
+      if (!d) continue;
+      if (by === "provider") for (const [p, u] of Object.entries(d.providers)) { series[k][p] = uval(u); totals[p] = (totals[p] || 0) + uval(u); }
+      else for (const [m, v] of Object.entries(d.usage.models)) { series[k][m] = mval(v); totals[m] = (totals[m] || 0) + mval(v); }
+    }
+    const order = Object.entries(totals).sort((a, b) => b[1] - a[1]).map((e) => e[0]);
+    const colorOf = (name) => providerColor[name] || PALETTE[order.indexOf(name) % PALETTE.length];
+    const W = 1000, H = 320, L = 56, B = 28, T = 10; const max = Math.max(...keys.map((k) => order.reduce((a, n) => a + (series[k][n] || 0), 0)), 1);
+    const bw = (W - L - 8) / keys.length; const sy = (v) => (H - B) - v / max * (H - B - T);
+    let svg = ""; const ticks = 4;
+    for (let i = 0; i <= ticks; i++) { const v = max * i / ticks; svg += `<line x1="${L}" x2="${W - 4}" y1="${sy(v)}" y2="${sy(v)}" stroke="#223044"/><text x="${L - 6}" y="${sy(v) + 4}" font-size="10" fill="#8b9bb0" text-anchor="end">${fmt(v)}</text>`; }
+    keys.forEach((k, i) => {
+      let y = H - B; const x = L + i * bw + bw * 0.15;
+      for (const n of order) { const v = series[k][n] || 0; if (!v) continue; const h = (H - B) - sy(v); y -= h; svg += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${(bw * 0.7).toFixed(1)}" height="${h.toFixed(1)}" fill="${colorOf(n)}"><title>${k} · ${esc(n)} · ${fmt(v)} ${unitLabel()}</title></rect>`; }
+      const step = keys.length > 45 ? 10 : keys.length > 20 ? 5 : keys.length > 10 ? 2 : 1;
+      if (i % step === 0 || i === keys.length - 1) svg += `<text x="${(x + bw * 0.35).toFixed(1)}" y="${H - 8}" font-size="10" fill="#8b9bb0" text-anchor="middle">${k.slice(5)}</text>`;
+    });
+    const grand = order.reduce((a, n) => a + totals[n], 0);
+    return `
+      <h2>Trends <span class="r">${unitLabel()} per day · ${keys[0]} → ${keys[keys.length - 1]}</span></h2>
+      <div class="tools"><div class="seg"><button data-by="provider" class="${by === "provider" ? "on" : ""}">By provider</button><button data-by="model" class="${by === "model" ? "on" : ""}">By model</button></div></div>
+      <div class="panel"><svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${svg}</svg>
+        <div class="legend">${order.map((n) => `<div><span class="sw" style="background:${colorOf(n)}"></span>${esc(n)}<span style="float:right">${fmt(totals[n])} · ${pct(totals[n], grand).toFixed(1)}%</span></div>`).join("") || '<div class="muted">No usage in range</div>'}</div></div>`;
+  }
+
+  function filteredSessions() {
+    const q = state.search.trim().toLowerCase();
+    let list = sessionsInRange().filter((s) => state.provider === "all" || s.provider === state.provider);
+    if (q) list = list.filter((s) => [s.label, s.id, s.display_id, s.project, s.project_root].some((v) => String(v || "").toLowerCase().includes(q)));
+    const key = {newest: (s) => s.timestamp || "", consumption: (s) => uval(s.usage), context: (s) => s.peak_context, prompts: (s) => s.prompts, project: (s) => s.project + (s.timestamp || "")}[state.sort];
+    return list.sort((a, b) => key(b) > key(a) ? 1 : key(b) < key(a) ? -1 : 0).sort(state.sort === "project" ? ((a, b) => a.project.localeCompare(b.project)) : (() => 0));
+  }
+  function renderSessions() {
+    const list = filteredSessions(); const max = Math.max(...list.map((s) => uval(s.usage)), 1);
+    return `
+      <h2>Sessions <span class="r">${list.length} in range · ${state.report.scope.sessions} analyzed</span></h2>
+      <div class="tools">
+        <input id="q" placeholder="search prompt, id, project… ( / )" value="${esc(state.search)}">
+        <select id="sort">${["newest", "consumption", "context", "prompts", "project"].map((k) => `<option value="${k}" ${state.sort === k ? "selected" : ""}>${k}</option>`).join("")}</select>
+        <div class="seg">${["all", "claude", "codex"].map((p) => `<button data-prov="${p}" class="${state.provider === p ? "on" : ""}">${p}</button>`).join("")}</div>
+      </div>
+      <div class="panel"><table><thead><tr><th>When</th><th>Tool</th><th>Project</th><th>First prompt</th><th class="num">Prompts</th><th class="num">${unitLabel()}</th><th></th><th class="num">Cache</th><th class="num">Peak ctx</th></tr></thead><tbody>
+      ${list.map((s, i) => `<tr class="srow" data-idx="${i}" data-href="#/session/${encodeURIComponent(s.id)}">
+        <td class="num muted" style="text-align:left">${esc(dmy(s.timestamp))}</td><td><span class="tag ${s.provider}">${esc(s.provider)}</span>${s.shards > 1 ? ` <span class="tag">${s.shards} shards</span>` : ""}</td>
+        <td title="${esc(s.project_root)}">${esc(s.project)}</td><td class="ptext" style="max-width:420px">${esc(s.label)}</td>
+        <td class="num">${s.prompts}</td><td class="num">${fmt(uval(s.usage))}</td><td style="min-width:90px"><div class="track"><div class="fill" style="width:${pct(uval(s.usage), max).toFixed(1)}%;background:${providerColor[s.provider] || PALETTE[0]}"></div></div></td>
+        <td class="num">${s.cache_hit_rate.toFixed(0)}%</td><td class="num">${fmt(s.peak_context)}</td></tr>`).join("") || `<tr><td colspan="9" class="empty">No sessions match</td></tr>`}
+      </tbody></table></div>`;
+  }
+
+  function renderProjects() {
+    const sessions = sessionsInRange(); const byRoot = {};
+    for (const s of sessions) { const p = byRoot[s.project_root] || (byRoot[s.project_root] = {root: s.project_root, name: s.project, usage: emptyUsage(), sessions: [], prompts: 0}); mergeUsage(p.usage, s.usage); p.sessions.push(s); p.prompts += s.prompts; }
+    const files = Object.fromEntries(state.report.projects.map((p) => [p.root, p.files]));
+    const list = Object.values(byRoot).sort((a, b) => uval(b.usage) - uval(a.usage)); const max = Math.max(...list.map((p) => uval(p.usage)), 1); const grand = list.reduce((a, p) => a + uval(p.usage), 0);
+    return `
+      <h2>Projects <span class="r">${list.length} projects · sessions grouped by full working directory · click to expand</span></h2>
+      <div class="panel">${list.map((p, i) => `
+        <details class="proj" ${state.expanded["proj:" + p.root] ? "open" : ""} data-proj="${esc(p.root)}"><summary>
+          <div class="row click" data-idx="${i}" data-toggle="proj:${esc(p.root)}"><div class="n" title="${esc(p.root)}">${esc(p.name)} <span class="muted">· ${p.sessions.length} sessions · ${p.prompts} prompts</span></div>
+          <div class="track"><div class="fill" style="width:${pct(uval(p.usage), max).toFixed(1)}%"></div></div><div class="num">${fmt(uval(p.usage))}</div><div class="num muted">${pct(uval(p.usage), grand).toFixed(1)}%</div></div></summary>
+          <div class="expand">
+            <h3>Model mix</h3>${modelRows(p.usage.models)}
+            <h3>Top sessions by ${unitLabel()}</h3>${bars(p.sessions.slice().sort((a, b) => uval(b.usage) - uval(a.usage)).slice(0, 5).map((s) => ({label: `${dmy(s.timestamp)} · ${s.label}`, value: uval(s.usage), href: `#/session/${encodeURIComponent(s.id)}`})), (e) => "#6cb4ee")}
+            <h3>Top files (operation counts, whole window)</h3>${(files[p.root] || []).length ? `<div class="kv">${files[p.root].map(([f, c]) => `<b>${c}×</b><span class="ptext">${esc(f)}</span>`).join("")}</div>` : '<div class="muted">none observed</div>'}
+          </div></details>`).join("") || '<div class="empty">No sessions in range</div>'}</div>`;
+  }
+
+  async function renderSession() {
+    const r = state.route; const main = $("#main");
+    const s = await loadSession(r.id);
+    if (r.prompt == null && r.shard == null) { main.innerHTML = sessionPage(s); afterRender(); return; }
+    let pos = r.prompt;
+    if (r.shard) { const hit = s.prompts.find((p) => p.shard === r.shard && p.index === r.prompt); if (hit) pos = hit.position; }
+    const p = await loadPrompt(r.id, pos);
+    main.innerHTML = r.request ? requestPage(s, p, r.request) : promptPage(s, p);
+    afterRender();
+  }
+  const crumbs = (s, p, extra) => `<div class="crumbs"><a href="#/sessions">sessions</a> › <a href="#/session/${encodeURIComponent(s.id)}">${esc(s.display_id)}</a>${p ? ` › <a href="#/session/${encodeURIComponent(s.id)}/prompt/${p.position}">prompt ${p.position}</a>` : ""}${extra ? " › " + extra : ""}</div>`;
+  function sessionPage(s) {
+    const u = s.usage;
+    return `${crumbs(s)}
+      <h2>Session <span class="r"><span class="tag ${s.provider}">${esc(s.provider)}</span> ${s.live ? '<span class="tag live">live</span>' : ""} ${s.paths.length > 1 ? `<span class="tag">${s.paths.length} shards</span>` : ""}</span></h2>
+      <div class="panel"><div class="kv"><b>id</b><span class="ptext">${esc(s.id)}</span><b>project</b><span class="ptext">${esc(s.project_root)}</span><b>files</b><span class="ptext">${s.paths.map(esc).join("<br>")}</span>
+        <b>usage</b><span>${fmt(u.total)} tokens · ${fmt(u.consumption)} consumption · ${fmt(u.output)} out · ${u.requests} requests · ${u.cache_hit_rate.toFixed(0)}% cache hit</span>
+        <b>context</b><span>latest ${fmt(s.latest_context)} · peak ${fmt(s.peak_context)} · session cache ${s.cache_hit_rate.toFixed(0)}%</span>${s.preamble.total ? `<b>preamble</b><span>${fmt(s.preamble.total)} tokens before the first prompt</span>` : ""}${s.malformed ? `<b>malformed</b><span>${s.malformed} lines skipped</span>` : ""}</div></div>
+      <h2>Prompts <span class="r">${s.prompts.length} · newest last · ↵ opens detail</span></h2>
+      <div class="panel"><table><thead><tr><th>#</th><th>Time</th><th>Prompt</th><th>Status</th><th class="num">Context</th><th class="num">Out</th><th class="num">Rounds</th><th class="num">Actors</th><th class="num">Files</th><th class="num">${unitLabel()}</th></tr></thead><tbody>
+      ${s.prompts.map((p, i) => `<tr class="prow" data-idx="${i}" data-href="#/session/${encodeURIComponent(s.id)}/prompt/${p.position}">
+        <td class="num muted">${p.position}</td><td class="num muted" style="text-align:left">${hm(p.timestamp)}</td><td class="ptext" style="max-width:520px">${esc(p.prompt)}${p.events.length ? `<div class="muted">${p.events.map(esc).join(" · ")}</div>` : ""}</td>
+        <td><span class="tag ${p.status.replace(" ", "-")}">${esc(p.status)}</span>${p.sub_sessions ? ` <span class="tag">${p.sub_sessions} sub</span>` : ""}</td>
+        <td class="num">${fmt(p.latest_context)} <span class="muted">(${p.latest_cache_hit_rate.toFixed(0)}%)</span></td><td class="num">${fmt(p.usage.output)}</td><td class="num">${p.requests}</td><td class="num">${p.actors}</td><td class="num">${p.files}</td><td class="num">${fmt(uval(p.usage))}</td></tr>`).join("") || `<tr><td colspan="10" class="empty">No prompts yet</td></tr>`}
+      </tbody></table></div>`;
+  }
+  function promptPage(s, p) {
+    const tabs = [["requests", `Requests ${p.requests.length}`], ["actors", `Actors ${p.actors.length + (p.main_actor ? 1 : 0)}`], ["timeline", `Timeline ${p.timeline.length}`], ["files", `Files ${p.files.length}`], ["context", "Context"], ["subs", `Sub-sessions ${p.sub_sessions.length}`], ["usage", `Usage observation ${p.usage_observations.length}`]];
+    const t = state.detailTab; let body = "";
+    if (t === "requests") body = p.requests.length ? `<table><thead><tr><th>#</th><th>Time</th><th>Model</th><th class="num">↓ Context</th><th class="num">Cached</th><th class="num">↑ Out</th><th>Stop</th><th>Actions</th></tr></thead><tbody>${p.requests.map((r, i) => `<tr class="rrow" data-idx="${i}" data-href="#/session/${encodeURIComponent(s.id)}/prompt/${p.position}/request/${r.index}"><td class="num muted">${r.index}</td><td class="muted">${hm(r.timestamp)}</td><td>${esc(r.model)}</td><td class="num">${fmt(r.usage.context_total)}</td><td class="num">${r.usage.cache_hit_rate.toFixed(0)}%</td><td class="num">${fmt(r.usage.output)}</td><td class="muted">${esc(r.stop_reason || "-")}</td><td>${r.actions.map((a) => `<div>→ ${esc(a)}</div>`).join("")}</td></tr>`).join("")}</tbody></table>` : '<div class="muted">No requests observed</div>';
+    else if (t === "actors") body = `<table><thead><tr><th>Actor</th><th>Status</th><th>Engine / model</th><th>Started</th><th>Elapsed</th><th>Exit</th><th>Tokens</th></tr></thead><tbody>${p.main_actor ? `<tr><td>${esc(p.main_actor)}</td><td><span class="tag">main</span></td><td>${esc(Object.keys(p.main.models)[0] || "")}</td><td></td><td></td><td></td><td class="num">${fmt(p.main.total)} · ${p.main.requests} req</td></tr>` : ""}${p.actors.map((a) => `<tr><td>${esc(a.label)}<div class="muted">${esc(a.task_id || a.tool_use_id || "")}${a.working_dir ? " · " + esc(a.working_dir) : ""}</div>${a.verdict ? `<div class="muted">verdict ${esc(a.verdict)}${a.rationale ? " · " + esc(a.rationale) : ""}</div>` : ""}</td><td><span class="tag ${a.status}">${esc(a.status)}</span></td><td>${esc(a.engine || "")} ${esc(a.model || "")}${a.mode ? `<div class="muted">${esc(a.mode)}${a.lane ? " · " + esc(a.lane) : ""}</div>` : ""}</td><td class="muted">${hm(a.started_at)}</td><td class="num">${a.elapsed_seconds != null ? a.elapsed_seconds.toFixed(0) + "s" : ""}</td><td class="num">${a.exit_code == null ? "" : a.exit_code}</td><td class="num">${a.token_usage.total_tokens != null ? fmt(a.token_usage.total_tokens) : ""}${a.rate_limits && a.rate_limits.primary ? `<div class="muted">${a.rate_limits.primary.used_percent}% / ${a.rate_limits.primary.window_minutes}m</div>` : ""}</td></tr>`).join("")}</tbody></table>`;
+    else if (t === "timeline") body = `<ul class="timeline">${p.timeline.map((e) => `<li><span class="t">${hm(e.timestamp)}</span>${esc(e.label)}</li>`).join("") || '<li class="muted">No events</li>'}</ul>`;
+    else if (t === "files") body = p.files.length ? `<ul class="timeline">${p.files.map((f) => `<li><span class="t">${hm(f.timestamp)}</span><span class="tag">${esc(f.action)}</span> ${esc(f.path)}</li>`).join("")}</ul>` : '<div class="muted">No file activity observed</div>';
+    else if (t === "context") body = p.context.length ? `<div class="kv">${p.context.map(([n, v]) => `<b>${esc(n)}</b><span class="num" style="text-align:left">${fmt(v)}</span>`).join("")}<b>Total</b><span>${fmt(p.latest_context)} (approx. attribution of the latest context)</span></div>` : '<div class="muted">No evidence to attribute</div>';
+    else if (t === "subs") body = p.sub_sessions.length ? `<div class="kv">${p.sub_sessions.map((x) => `<b>${esc(x.key)}</b><span>${esc(x.label)} · ${fmt(x.usage.total)} tokens · ${x.usage.requests} req · ${x.usage.cache_hit_rate.toFixed(0)}% cache</span>`).join("")}</div>` : '<div class="muted">No subagents in this prompt</div>';
+    else if (t === "usage") body = p.usage_observations.length ? p.usage_observations.map((o) => `<div class="kv"><b>before ${esc(o.before_time)}</b><span>5h ${o.before_5h}% · weekly ${o.before_weekly}%</span><b>after ${esc(o.after_time)}</b><span>5h ${o.after_5h}% · weekly ${o.after_weekly}%</span><b>delta</b><span>5h ${o.delta_5h > 0 ? "+" : ""}${o.delta_5h.toFixed(1)} pp · weekly ${o.delta_weekly > 0 ? "+" : ""}${o.delta_weekly.toFixed(1)} pp</span><b>confidence</b><span>${esc(o.confidence)}${o.confidence_reason ? " · " + esc(o.confidence_reason) : ""}</span></div>`).join("<hr>") : '<div class="muted">No observation captured for this prompt</div>';
+    return `${crumbs(s, p)}
+      <h2>Prompt ${p.position} <span class="r"><span class="tag ${p.status.replace(" ", "-")}">${esc(p.status)}</span> ${hm(p.timestamp)}${p.duration_seconds != null ? " · " + p.duration_seconds + "s" : ""}</span></h2>
+      <div class="panel"><div class="ptext">“${esc(p.prompt)}”</div>
+        <div class="kv" style="margin-top:10px"><b>I/O</b><span>${fmt(p.latest_context)} context (${p.latest_cache_hit_rate.toFixed(0)}% cached) · ${fmt(p.usage.output)} out · ${fmt(uval(p.usage))} ${unitLabel()}</span>
+        <b>Work</b><span>${p.requests.length} thinking rounds · ${p.timeline.length} events · ${p.files.length} file ops${p.events.length ? " · " + p.events.map(esc).join(", ") : ""}</span></div></div>
+      <div class="subtabs">${tabs.map(([k, l]) => `<button data-tab="${k}" class="${t === k ? "on" : ""}">${l}</button>`).join("")}</div>
+      <div class="panel">${body}</div>`;
+  }
+  function requestPage(s, p, k) {
+    const r = p.requests[k - 1]; if (!r) return `${crumbs(s, p)}<div class="empty">Request ${k} not found</div>`;
+    const cmds = r.actions.map((a, i) => a.split(" · ")[0] === "Bash" ? (r.action_details[i] || "") : "").filter(Boolean).join("\n\n");
+    return `${crumbs(s, p, `request ${k}`)}
+      <h2>Request ${k} of ${p.requests.length} <span class="r">${hm(r.timestamp)} · ${esc(r.model)} · ↓ ${fmt(r.usage.context_total)} (${r.usage.cache_hit_rate.toFixed(0)}% cached) · ↑ ${fmt(r.usage.output)} · ${esc(r.stop_reason || "-")}</span></h2>
+      <div class="panel">${cmds ? `<button class="copy" data-copy="${esc(cmds)}">copy Bash commands</button>` : ""}
+      ${r.actions.length ? r.actions.map((a, i) => `<h3 style="margin:14px 0 4px;font-size:13px">${i + 1}. ${esc(a)}</h3><pre class="cmd">${a.split(" · ")[0] === "Bash" ? "$ " : ""}${esc(r.action_details[i] || a)}</pre>${r.action_outputs[i] ? `<div class="muted" style="font-size:11px">output</div><pre>${esc(r.action_outputs[i])}</pre>` : '<div class="muted" style="font-size:11px">no output captured</div>'}`).join("") : '<div class="muted">No actions observed</div>'}</div>
+      <div class="hint">← previous / → next request also work on the keyboard</div>`;
+  }
+
+  // ---------- events
+  document.addEventListener("click", (ev) => {
+    const el = ev.target.closest("[data-href], [data-toggle], [data-range], [data-unit], [data-by], [data-prov], [data-tab], [data-copy]");
+    if (!el) return;
+    if (el.dataset.href) { if (!ev.target.closest("a")) { state.sel = 0; go(el.dataset.href); } return; }
+    if (el.dataset.toggle) { const k = el.dataset.toggle; state.expanded[k] = !state.expanded[k]; const sub = document.querySelector(`[data-sub="${CSS.escape(k)}"]`); if (sub) sub.hidden = !state.expanded[k]; if (k.startsWith("proj:")) { ev.preventDefault(); el.closest("details").open = state.expanded[k]; } return; }
+    if (el.dataset.range) { state.range = Number(el.dataset.range); try { localStorage.setItem("am.range", state.range); } catch (e) {} render(); return; }
+    if (el.dataset.unit) { state.unit = el.dataset.unit; try { localStorage.setItem("am.unit", state.unit); } catch (e) {} render(); return; }
+    if (el.dataset.by) { state.trendBy = el.dataset.by; render(); return; }
+    if (el.dataset.prov) { state.provider = el.dataset.prov; state.sel = 0; render(); return; }
+    if (el.dataset.tab && el.tagName === "BUTTON") { state.detailTab = el.dataset.tab; state.sel = 0; render(); return; }
+    if (el.dataset.copy != null) { navigator.clipboard && navigator.clipboard.writeText(el.dataset.copy).then(() => { el.textContent = "copied"; setTimeout(() => (el.textContent = "copy Bash commands"), 1200); }); }
+  });
+  document.addEventListener("input", (ev) => { if (ev.target.id === "q") { state.search = ev.target.value; state.sel = 0; const pos = ev.target.selectionStart; render(); const q = $("#q"); if (q) { q.focus(); q.setSelectionRange(pos, pos); } } });
+  document.addEventListener("change", (ev) => { if (ev.target.id === "sort") { state.sort = ev.target.value; state.sel = 0; render(); } });
+  document.addEventListener("keydown", (ev) => {
+    const typing = ev.target.tagName === "INPUT" || ev.target.tagName === "SELECT";
+    if (typing) { if (ev.key === "Escape") { ev.target.blur(); } else if (ev.key === "Enter" && ev.target.id === "q") { ev.target.blur(); const row = document.querySelector("[data-idx].sel"); if (row) go(row.dataset.href); } return; }
+    const rows = Array.from(document.querySelectorAll("[data-idx]"));
+    const r = state.route;
+    if (ev.key === "j" || ev.key === "ArrowDown") { if (rows.length) { state.sel = Math.min(rows.length - 1, state.sel + 1); afterRender(); ev.preventDefault(); } }
+    else if (ev.key === "k" || ev.key === "ArrowUp") { if (rows.length) { state.sel = Math.max(0, state.sel - 1); afterRender(); ev.preventDefault(); } }
+    else if (ev.key === "Enter" || (ev.key === "ArrowRight" && !(r.view === "session" && r.request))) { const row = rows[state.sel]; if (row && row.dataset.href) { state.sel = 0; go(row.dataset.href); } else if (row && row.dataset.toggle) row.click(); }
+    else if (ev.key === "ArrowRight" && r.view === "session" && r.request) { go(`#/session/${encodeURIComponent(r.id)}/prompt/${r.prompt}/request/${r.request + 1}`); }
+    else if (ev.key === "ArrowLeft" && r.view === "session" && r.request && r.request > 1) { go(`#/session/${encodeURIComponent(r.id)}/prompt/${r.prompt}/request/${r.request - 1}`); }
+    else if (ev.key === "Escape" || ev.key === "ArrowLeft" || ev.key === "h") { const b = backRoute(); if (b) { state.sel = 0; go(b); } }
+    else if (["1", "2", "3", "4"].includes(ev.key)) { state.sel = 0; go(["#/overview", "#/trends", "#/sessions", "#/projects"][Number(ev.key) - 1]); }
+    else if (ev.key === "/") { const q = $("#q"); if (q) { q.focus(); ev.preventDefault(); } else { go("#/sessions"); setTimeout(() => { const q2 = $("#q"); if (q2) q2.focus(); }, 0); ev.preventDefault(); } }
+    else if (ev.key === "r") { state.sessions = {}; state.prompts = {}; loadReport(); }
+    else if (ev.key === "u") { state.unit = state.unit === "consumption" ? "raw" : "consumption"; render(); }
+  });
+  window.addEventListener("hashchange", () => { render(); });
+  loadReport().then(poll);
+  setInterval(() => { poll(); }, 2000);
+})();
+</script>
+</body>
+</html>

@@ -13,8 +13,8 @@ All tools use the Python 3 standard library or macOS system commands. Agent cred
 ## Install from a release tar
 
 ```sh
-tar -xzf tools-0.3.0.tar.gz
-cd tools-0.3.0
+tar -xzf tools-0.3.1.tar.gz
+cd tools-0.3.1
 scripts/install.sh
 ```
 
@@ -36,9 +36,9 @@ curl --proto '=https' --tlsv1.2 --fail --location \
   --netrc-file <(printf 'machine api.github.com\nlogin token\npassword %s\n' "$GITHUB_TOKEN") \
   -H 'Accept: application/vnd.github.raw+json' \
   -o /tmp/bootstrap-tools.sh \
-  'https://api.github.com/repos/nutthaphonCh/tools/contents/scripts/bootstrap-private-release.sh?ref=v0.3.0'
+  'https://api.github.com/repos/nutthaphonCh/tools/contents/scripts/bootstrap-private-release.sh?ref=v0.3.1'
 chmod 700 /tmp/bootstrap-tools.sh
-/tmp/bootstrap-tools.sh --version 0.3.0
+/tmp/bootstrap-tools.sh --version 0.3.1
 ```
 
 The bootstrap keeps the token out of curl's argument list, downloads the release tar and checksum through the GitHub Contents API, verifies SHA-256, extracts into a temporary directory, and runs its installer. It does not create a Git checkout.
@@ -57,7 +57,7 @@ Request detail pairs each action with a bounded output preview. Press `y` to cop
 
 Press `o` (or `O`) from Live or History to open **Overall**, covering every discoverable Claude and Codex session active in the last 90 days. Raw volume is not presented as the ranking unit. Projects, providers, models, sessions, and the time trend all use one configurable consumption score: `fresh × 1.0 + cache-read × 0.1`. Here, fresh includes uncached input, cache creation, and output. This score is a comparison heuristic—not price, billing, or direct compute usage. Configure the weights with `AGENT_MONITOR_FRESH_WEIGHT` and `AGENT_MONITOR_CACHE_WEIGHT`. Projects are grouped by the session's full working directory (two directories that merely share a basename, such as `work/tools` and `lg/tools`, stay separate and are labelled with enough parent segments to tell apart), and a session launched from a Claude Code scratchpad directory is attributed to the project of the session that owns that scratchpad. Daily trend buckets and session dates use the viewer's local timezone, not UTC.
 
-The first scan runs in the background; animated progress lives in the bottom bar's global right-hand status area and remains visible from other views. Select a project with `Up`/`Down` and `Enter`/`Right`, then select one of its five highest-consumption sessions and jump to it the same way. `Esc`/`Left` restores the originating session and page. Session metadata shows latest and peak context plus the cache percentage aggregated across the complete logical session—not merely its latest request. Codex continuation shards with the same root thread ID are combined before scoring. File rankings use observed operation counts only and do not claim consumption attribution.
+The first scan runs in the background; animated progress lives in the bottom bar's global right-hand status area and remains visible from other views. Select a project with `Up`/`Down` and `Enter`/`Right`, then select one of its five highest-consumption sessions and jump to it the same way. `Esc`/`Left` restores the originating session and page. Session metadata shows latest and peak context plus the cache percentage aggregated across the complete logical session—not merely its latest request. Codex continuation shards with the same root thread ID are combined before scoring. Claude Code subagent transcripts (`<session>/subagents/agent-*.jsonl`) are read alongside the parent transcript and attributed to the prompt that spawned them via `promptId`, so sessions that fan out work to agents are not undercounted. Repeated Codex `token_count` snapshots whose cumulative total has not changed are treated as replays and counted once. File rankings use observed operation counts only and do not claim consumption attribution.
 
 Search input uses the terminal's Unicode-aware character API, so `/` accepts Thai text. Enter `#<full-session-id>` and press `Enter` to resolve that exact logical session across Claude and Codex and open its first prompt detail immediately. A unique ID prefix, full rollout filename, or shortened rollout display ID is accepted as well. `Esc`/`Left` from a search jump restores the page and session where the search began.
 
@@ -65,9 +65,24 @@ On the Overall page only, `p` (or `P`) exports the same report as a single, self
 
 The scoring policy and its limitations are documented in [docs/consumption-score.md](docs/consumption-score.md). The observed Codex thread/rollout/shard model and aggregation rules are documented separately in [docs/codex-session-storage.md](docs/codex-session-storage.md).
 
+## Detach mode
+
+`d` on any page detaches the view on screen into the browser: it starts a dashboard server bound to `127.0.0.1` on a random port (once per run), opens the default browser at the same place you were looking at, and keeps the terminal running. From a session it opens that session; from a prompt or request detail it opens that prompt or request (Codex continuation shards resolve to the right prompt); from Overall or a project it opens the overview or the project ranking. `D` stops the server; quitting `agent-monitor` stops it as well. Set `AGENT_MONITOR_NO_BROWSER=1` to skip opening the browser and just print the URL in the status area.
+
+The page is `dashboard.html`, one self-contained file with inline CSS and JavaScript that talks only to that loopback server. It has four tabs plus session browsing:
+
+- **Overview**: consumption or raw-token tiles (sessions, requests, active days, current streak, peak day, top model, cache hit, output), a per-day activity heatmap, and by-provider and by-model rankings; a model row expands into its fresh / cache-read / request split.
+- **Trends**: stacked daily bars by provider or by model with a legend of totals and shares.
+- **Sessions**: every analyzed session with search, provider filter, and sorting by recency, consumption, peak context, prompts, or project.
+- **Projects**: the same full-working-directory ranking as the terminal, expandable into model mix, top sessions, and top files.
+- **Session → prompt → request**: the same drill-down as the terminal. A session lists its prompts with status, latest context and cache percentage, output, thinking rounds, actors, and file operations; a prompt shows Requests, Actors, Timeline, Files, Context attribution, Sub-sessions, and Usage observation; a request shows each action's complete command and bounded output with a copy button for its Bash commands.
+
+The range switch (Today / 7d / 30d / 90d) and the unit switch (consumption score / raw tokens) apply everywhere; the choice is remembered per browser. Keyboard: `↑`/`↓` or `j`/`k` select, `↵`/`→` open, `←`/`esc` back, `1`-`4` switch tabs, `/` searches sessions, `u` toggles the unit, `r` reloads. The server rebuilds the report in the background every 60 seconds (`AGENT_MONITOR_DASHBOARD_REFRESH`, minimum 5) using the same accounting the terminal shows, so the dashboard never grows a second set of numbers; the page polls `/api/status` and refreshes itself when a newer report exists, and a live session re-reads on each poll. The JSON behind it is available at `/api/report`, `/api/session/<id>`, and `/api/session/<id>/prompt/<n>` on that server. The `p` export stays a static, script-free file.
+
+
 ## Development
 
 ```sh
 python3 -m unittest tests.test_monitoring
-scripts/build-release.sh 0.3.0
+scripts/build-release.sh 0.3.1
 ```

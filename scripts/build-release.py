@@ -15,6 +15,7 @@ FILES = (
     "docs/codex-session-storage.md",
     "docs/consumption-score.md",
     "monitoring.py",
+    "dashboard.html",
     "tools/codex_telemetry.py",
     "scripts/install.sh",
     "scripts/install-apple-container.sh",
