@@ -38,6 +38,7 @@ No dependencies — Python 3 standard library only.
 from __future__ import annotations
 
 import argparse
+import copy
 import curses
 import datetime as dt
 import glob
@@ -3267,6 +3268,41 @@ def load_session_analyses(path: str, cache: ProfilerCache | None) -> list[tuple[
     return analyses
 
 
+def merged_session_analysis(
+    path: str, cache: ProfilerCache | None = None,
+    current_analyzer: IncrementalSessionAnalyzer | CodexSessionAnalyzer | None = None,
+) -> Analysis:
+    """Return one TUI analysis spanning every shard of a logical Codex session.
+
+    Codex can continue one user-facing thread in multiple rollout files. Keep the
+    physical analyzer for the selected/current file incremental, but present deep
+    copies of all shard prompts with session-wide indices so navigation and detail
+    lookup cannot collide on each shard's local ``1..N`` numbering.
+    """
+    if session_provider(path) != "codex":
+        analyzer = current_analyzer or (cache.analyzer(path) if cache else create_analyzer(path))
+        return analyzer.analysis
+
+    prompts: list[PromptTurn] = []
+    preamble = Usage()
+    malformed = 0
+    record_count = 0
+    for shard_path in codex_rollout_shards(path):
+        if current_analyzer is not None and Path(shard_path).resolve() == Path(path).resolve():
+            analysis = current_analyzer.analysis
+        else:
+            analyzer = cache.analyzer(shard_path) if cache else create_analyzer(shard_path)
+            analysis = analyzer.analysis
+        preamble.merge(analysis.preamble)
+        malformed += analysis.malformed
+        record_count += analysis.record_count
+        for source_prompt in analysis.prompts:
+            prompt = copy.deepcopy(source_prompt)
+            prompt.index = len(prompts) + 1
+            prompts.append(prompt)
+    return Analysis(path, prompts, preamble, malformed, record_count, provider="codex")
+
+
 def session_detail_payload(path: str, cache: ProfilerCache | None, prompt_position: int | None = None) -> dict[str, Any]:
     """Session summary with one row per prompt, or (with ``prompt_position``) one prompt in full."""
     analyses = load_session_analyses(path, cache)
@@ -3867,7 +3903,7 @@ class TTYApp:
         self.last_mtime = -1.0
         self.last_refresh = 0.0
         self.analyzer = cache.analyzer(path) if cache else create_analyzer(path)
-        self.analysis = self.analyzer.analysis
+        self.analysis = merged_session_analysis(path, cache, self.analyzer)
         self.last_record_count = self.analysis.record_count
         self.feed: list[tuple[int, str]] = []
         self.history: list[tuple[int, str]] = []
@@ -3899,7 +3935,7 @@ class TTYApp:
         self.path = self.session_paths[index]
         self.provider_positions[session_provider(self.path)] = self.path
         self.analyzer = self.cache.analyzer(self.path) if self.cache else create_analyzer(self.path)
-        self.analysis = self.analyzer.analysis
+        self.analysis = merged_session_analysis(self.path, self.cache, self.analyzer)
         self.last_record_count = self.analysis.record_count
         self.mode, self.follow, self.new_events = "list", True, 0
         self.cursor, self.offset = {1: 0, 2: 0}, {1: 0, 2: 0}
@@ -3942,7 +3978,7 @@ class TTYApp:
         self.path = target
         self.provider_positions[target_provider] = target
         self.analyzer = self.cache.analyzer(self.path) if self.cache else create_analyzer(self.path)
-        self.analysis = self.analyzer.analysis
+        self.analysis = merged_session_analysis(self.path, self.cache, self.analyzer)
         self.last_record_count = self.analysis.record_count
         self.mode, self.follow, self.new_events = "list", True, 0
         self.cursor, self.offset = {1: 0, 2: 0}, {1: 0, 2: 0}
@@ -3975,7 +4011,7 @@ class TTYApp:
         self.path = path
         self.provider_positions[target_provider] = path
         self.analyzer = self.cache.analyzer(path) if self.cache else create_analyzer(path)
-        self.analysis = self.analyzer.analysis
+        self.analysis = merged_session_analysis(path, self.cache, self.analyzer)
         self.last_record_count = self.analysis.record_count
         self.view, self.follow, self.new_events = 1, True, 0
         self.mode = "list"
@@ -4050,7 +4086,7 @@ class TTYApp:
                     changed = self.analyzer.poll()
                     if changed and self.cache:
                         self.cache.save(self.analyzer)
-                self.analysis = self.analyzer.analysis
+                self.analysis = merged_session_analysis(self.path, self.cache, self.analyzer)
                 self.feed = live_feed(self.analysis)
                 self.history = history_feed(self.analysis)
                 if self.search_query:

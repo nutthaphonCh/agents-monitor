@@ -61,7 +61,8 @@ child agent or unrelated transcript into the parent.
 
 ## `agent-monitor` accounting rules
 
-Overall reporting follows these rules:
+Overall reporting, the browser dashboard, and the terminal Live/History views
+follow these rules:
 
 1. Discover one current rollout path per visible logical Codex thread from the
    state database.
@@ -72,6 +73,10 @@ Overall reporting follows these rules:
 5. Sort the retained shards chronologically.
 6. Parse every shard and merge its measured request usage.
 7. Count the result as one session, regardless of shard count.
+
+The terminal renumbers the merged prompts consecutively for display and
+navigation. Prompt numbers inside an individual rollout file are shard-local and
+therefore are not stable logical-session identifiers.
 
 ## Display ID convention
 

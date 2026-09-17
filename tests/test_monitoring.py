@@ -1539,6 +1539,37 @@ class OverallPageTests(unittest.TestCase):
             self.assertIn(f"full rollout {current.stem}", html_text)
             self.assertIn("2 shard(s)", html_text)
 
+    def test_codex_tui_analysis_merges_shards_and_renumbers_prompts(self):
+        thread_id = "01a06201-c11e-7430-9dc1-57700eb22393"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            first = Path(tmp_dir) / f"rollout-2026-07-20T10-00-00-{thread_id}.jsonl"
+            current = Path(tmp_dir) / (
+                f"rollout-2026-07-20T11-00-00-{thread_id}_"
+                "01a0624a-fb7e-7531-a77e-de8c2abc4417.jsonl"
+            )
+            for path, prompt_text, timestamp in (
+                (first, "Earlier prompt", "2026-07-20T10:00:01Z"),
+                (current, "Continuation prompt", "2026-07-20T11:00:01Z"),
+            ):
+                records = codex_records()
+                records[0]["payload"]["id"] = thread_id
+                records[0]["payload"]["session_id"] = thread_id
+                records[3]["timestamp"] = timestamp
+                records[3]["payload"]["item"]["content"][0]["text"] = prompt_text
+                path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+            current_analyzer = monitoring.create_analyzer(str(current))
+            analysis = monitoring.merged_session_analysis(
+                str(current), current_analyzer=current_analyzer,
+            )
+
+            self.assertEqual([prompt.prompt for prompt in analysis.prompts], [
+                "Earlier prompt", "Continuation prompt",
+            ])
+            self.assertEqual([prompt.index for prompt in analysis.prompts], [1, 2])
+            self.assertEqual(analysis.record_count, len(codex_records()) * 2)
+            self.assertEqual(len(monitoring.history_feed(analysis)), 2)
+
     def test_codex_rollout_display_id_strips_each_uuid_tail(self):
         root = "rollout-2026-09-03T16-30-06-01a0669a-a7a5-71f1-8431-59a6fa3c6ce0"
         shard = (

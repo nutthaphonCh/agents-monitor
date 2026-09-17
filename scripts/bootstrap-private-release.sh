@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.3.0"
+VERSION="0.3.1"
 REPOSITORY="nutthaphonCh/tools"
 PREFIX="${HOME}/.local"
 
