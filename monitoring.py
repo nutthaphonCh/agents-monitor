@@ -11,7 +11,7 @@ Keys
   1 / 2       switch view
   [           previous session
   ]           next session
-  z / x       Claude / Codex sessions
+  z x c v ... switch between the profiles discovered on this machine
   o / O       Overall consumption page
   p           background processes for the current session; on the Overall
               page, p/P instead exports a self-contained shareable HTML report
@@ -64,6 +64,7 @@ from typing import Any, Callable
 
 REFRESH_INTERVAL = 0.5
 CACHE_SCHEMA_VERSION = 13
+VERSION = "0.3.2"
 ESCAPE_DELAY_MS = 25
 ACTION_NAMES = (
     "WebSearch", "WebFetch", "Bash", "Write", "Edit", "Read", "Glob", "Grep", "Search",
@@ -312,6 +313,16 @@ class Analysis:
 # Older sessions are skipped before parsing (cheap: file mtime only) and their count is
 # always shown in the scope line, so the window is visible rather than silently applied.
 OVERALL_WINDOW_DAYS = 90
+PROFILE_HOTKEYS = "zxcvbnm"
+
+
+@dataclass(frozen=True)
+class SessionProfile:
+    """One independently stored Claude/Codex session profile on this host."""
+    id: str
+    label: str
+    provider: str
+    sessions_dir: Path
 
 
 @dataclass
@@ -386,6 +397,50 @@ def default_codex_state_db() -> Path:
     return Path(os.path.expanduser("~/.codex/state_5.sqlite"))
 
 
+def codex_profile_label(home: Path) -> str:
+    if home == Path.home() / ".codex":
+        return "Codex"
+    suffix = home.name.removeprefix(".codex-")
+    if suffix == "the-second":
+        return "2nd"
+    return suffix.replace("-", " ").title() or home.name
+
+
+def discover_session_profiles() -> list[SessionProfile]:
+    """Discover host-local profiles in stable shortcut order."""
+    profiles: list[SessionProfile] = []
+    claude_root = default_projects_dir()
+    if claude_root.is_dir():
+        profiles.append(SessionProfile("claude", "Claude", "claude", claude_root))
+
+    conventional_home = Path.home() / ".codex"
+    default_home = default_codex_sessions_dir().parent
+    homes = [default_home]
+    # Keeping the default roots injectable makes discovery deterministic for
+    # embedders and tests. Host-wide isolated-profile discovery applies only
+    # when the conventional default root is in use.
+    if default_home == conventional_home:
+        homes.extend(sorted(path for path in Path.home().glob(".codex-*") if path.is_dir()))
+        configured_home = os.environ.get("CODEX_HOME", "").strip()
+        if configured_home:
+            homes.append(Path(os.path.expanduser(configured_home)))
+
+    seen: set[str] = set()
+    for home in homes:
+        resolved = str(home.resolve())
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        sessions_dir = home / "sessions"
+        if not sessions_dir.is_dir():
+            continue
+        profile_id = "codex" if home == default_home else f"codex:{resolved}"
+        profiles.append(SessionProfile(
+            profile_id, codex_profile_label(home), "codex", sessions_dir,
+        ))
+    return profiles
+
+
 def codex_session_metadata(path: str) -> tuple[str, str] | None:
     """Return (chat id, thread source) from a rollout's session metadata."""
     try:
@@ -405,9 +460,9 @@ def codex_session_metadata(path: str) -> tuple[str, str] | None:
     return chat_id, source if isinstance(source, str) else ""
 
 
-def fallback_codex_chats() -> list[tuple[float, str]]:
+def fallback_codex_chats(sessions_dir: Path | None = None) -> list[tuple[float, str]]:
     """Discover one latest user-facing rollout per chat without the state DB."""
-    root = default_codex_sessions_dir()
+    root = sessions_dir or default_codex_sessions_dir()
     if not root.exists():
         return []
     chats: dict[str, tuple[float, str]] = {}
@@ -426,9 +481,13 @@ def fallback_codex_chats() -> list[tuple[float, str]]:
     return list(chats.values())
 
 
-def codex_chats() -> list[tuple[float, str]]:
+def codex_chats(profile: SessionProfile | None = None) -> list[tuple[float, str]]:
     """Read Codex's chat ordering and current rollout path from local state."""
-    state_db = default_codex_state_db()
+    state_db = (
+        default_codex_state_db()
+        if profile is None or profile.id == "codex"
+        else profile.sessions_dir.parent / "state_5.sqlite"
+    )
     try:
         connection = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True)
         try:
@@ -444,7 +503,7 @@ def codex_chats() -> list[tuple[float, str]]:
         finally:
             connection.close()
     except (OSError, sqlite3.Error):
-        return fallback_codex_chats()
+        return fallback_codex_chats(profile.sessions_dir if profile else None)
 
     chats: list[tuple[float, str]] = []
     seen: set[str] = set()
@@ -465,7 +524,7 @@ def codex_chats() -> list[tuple[float, str]]:
             os.path.getmtime(path),
         )
         chats.append((timestamp, path))
-    return chats or fallback_codex_chats()
+    return chats or fallback_codex_chats(profile.sessions_dir if profile else None)
 
 
 ACTIVITY_TAIL_BYTES = 65536
@@ -502,12 +561,15 @@ def claude_session_activity(path: str) -> float:
 def find_all_session_entries() -> list[tuple[float, str]]:
     """Discovered sessions as (last activity epoch, path), newest first."""
     sessions: list[tuple[float, str]] = []
-    claude_root = default_projects_dir()
-    if claude_root.exists():
-        for path in glob.glob(str(claude_root / "**" / "*.jsonl"), recursive=True):
+    profiles = discover_session_profiles()
+    claude_profile = next((item for item in profiles if item.provider == "claude"), None)
+    if claude_profile:
+        for path in glob.glob(str(claude_profile.sessions_dir / "**" / "*.jsonl"), recursive=True):
             if "subagents" not in Path(path).parts:
                 sessions.append((claude_session_activity(path), path))
-    sessions.extend(codex_chats())
+    for profile in profiles:
+        if profile.provider == "codex":
+            sessions.extend(codex_chats(profile))
     return sorted(sessions, key=lambda item: (item[0], item[1]), reverse=True)
 
 
@@ -519,6 +581,16 @@ def session_provider(path: str) -> str:
     if Path(path).name.startswith("rollout-") or default_codex_sessions_dir() in Path(path).parents:
         return "codex"
     return "claude"
+
+
+def session_profile_id(path: str, profiles: list[SessionProfile] | None = None) -> str:
+    """Identify the storage profile without changing Claude/Codex accounting."""
+    path_obj = Path(path)
+    candidates = profiles if profiles is not None else discover_session_profiles()
+    for profile in candidates:
+        if profile.sessions_dir in path_obj.parents:
+            return profile.id
+    return "codex" if session_provider(path) == "codex" else "claude"
 
 
 def resolve_target(arg: str | None) -> str:
@@ -3861,12 +3933,19 @@ class TTYApp:
         self.all_session_paths = find_all_sessions()
         if path not in self.all_session_paths:
             self.all_session_paths.insert(0, path)
-        active_provider = session_provider(path)
+        self.profiles = discover_session_profiles()
+        active_profile = session_profile_id(path, self.profiles)
+        if not any(profile.id == active_profile for profile in self.profiles):
+            provider = session_provider(path)
+            self.profiles.append(SessionProfile(
+                active_profile, provider.title(), provider, Path(path).parent,
+            ))
         self.session_paths = [
-            item for item in self.all_session_paths if session_provider(item) == active_provider
+            item for item in self.all_session_paths
+            if session_profile_id(item, self.profiles) == active_profile
         ]
         self.session_index = self.session_paths.index(path)
-        self.provider_positions: dict[str, str] = {active_provider: path}
+        self.profile_positions: dict[str, str] = {active_profile: path}
         self.view = 1
         self.mode = "list"
         self.follow = True
@@ -3911,11 +3990,15 @@ class TTYApp:
         self.status = "ready"
 
     def refresh_session_catalog(self) -> None:
-        current_provider = session_provider(self.path)
+        current_profile = session_profile_id(self.path, self.profiles)
         previous_paths = self.session_paths
+        refreshed_profiles = discover_session_profiles()
+        if any(profile.id == current_profile for profile in refreshed_profiles):
+            self.profiles = refreshed_profiles
         all_paths = find_all_sessions()
         candidates = [
-            path for path in all_paths if session_provider(path) == current_provider
+            path for path in all_paths
+            if session_profile_id(path, self.profiles) == current_profile
         ]
         if self.path not in candidates:
             candidates.insert(min(self.session_index, len(candidates)), self.path)
@@ -3933,7 +4016,7 @@ class TTYApp:
             return
         self.session_index = index
         self.path = self.session_paths[index]
-        self.provider_positions[session_provider(self.path)] = self.path
+        self.profile_positions[session_profile_id(self.path, self.profiles)] = self.path
         self.analyzer = self.cache.analyzer(self.path) if self.cache else create_analyzer(self.path)
         self.analysis = merged_session_analysis(self.path, self.cache, self.analyzer)
         self.last_record_count = self.analysis.record_count
@@ -3948,8 +4031,11 @@ class TTYApp:
         return self.session_index > 0, self.session_index < len(self.session_paths) - 1
 
     def session_header(self, width: int) -> str:
-        provider = self.analysis.provider.title()
-        prefix = f"< · {provider} · "
+        profiles = getattr(self, "profiles", [])
+        profile_id = session_profile_id(self.path, profiles)
+        profile = next((item for item in profiles if item.id == profile_id), None)
+        label = profile.label if profile else self.analysis.provider.title()
+        prefix = f"< · {label} · "
         suffix = f" · {self.status} · >"
         stem_width = max(1, width - len(prefix) - len(suffix))
         identity = Path(self.path).stem
@@ -3957,26 +4043,28 @@ class TTYApp:
             identity = display_rollout_id(identity)
         return truncate_layout(prefix + truncate(identity, stem_width) + suffix, width)
 
-    def select_provider(self, target_provider: str) -> None:
-        current_provider = session_provider(self.path)
-        if target_provider == current_provider:
+    def select_profile(self, target_profile: str) -> None:
+        current_profile = session_profile_id(self.path, self.profiles)
+        if target_profile == current_profile:
             return
         candidates = [
             path for path in self.all_session_paths
-            if session_provider(path) == target_provider
+            if session_profile_id(path, self.profiles) == target_profile
         ]
         if not candidates:
-            self.status = f"no {target_provider} sessions"
-            self.set_status_area(f"No {target_provider} sessions found")
+            profile = next((item for item in self.profiles if item.id == target_profile), None)
+            label = profile.label if profile else target_profile
+            self.status = f"no {label} sessions"
+            self.set_status_area(f"No {label} sessions found")
             return
-        self.provider_positions[current_provider] = self.path
-        target = self.provider_positions.get(target_provider, candidates[0])
+        self.profile_positions[current_profile] = self.path
+        target = self.profile_positions.get(target_profile, candidates[0])
         if target not in candidates:
             target = candidates[0]
         self.session_paths = candidates
         self.session_index = candidates.index(target)
         self.path = target
-        self.provider_positions[target_provider] = target
+        self.profile_positions[target_profile] = target
         self.analyzer = self.cache.analyzer(self.path) if self.cache else create_analyzer(self.path)
         self.analysis = merged_session_analysis(self.path, self.cache, self.analyzer)
         self.last_record_count = self.analysis.record_count
@@ -3997,19 +4085,20 @@ class TTYApp:
             return False
         if return_mode is not None:
             self.jump_return = (self.path, return_mode)
-        current_provider = session_provider(self.path)
-        target_provider = session_provider(path)
-        self.provider_positions[current_provider] = self.path
+        current_profile = session_profile_id(self.path, self.profiles)
+        target_profile = session_profile_id(path, self.profiles)
+        self.profile_positions[current_profile] = self.path
         discovered = find_all_sessions()
         if path not in discovered:
             discovered.insert(0, path)
         self.all_session_paths = discovered
         self.session_paths = [
-            item for item in discovered if session_provider(item) == target_provider
+            item for item in discovered
+            if session_profile_id(item, self.profiles) == target_profile
         ]
         self.session_index = self.session_paths.index(path)
         self.path = path
-        self.provider_positions[target_provider] = path
+        self.profile_positions[target_profile] = path
         self.analyzer = self.cache.analyzer(path) if self.cache else create_analyzer(path)
         self.analysis = merged_session_analysis(path, self.cache, self.analyzer)
         self.last_record_count = self.analysis.record_count
@@ -4487,9 +4576,14 @@ class TTYApp:
                 return True
         if key == ord("q"):
             return False
-        if key == ord("z"):
-            self.select_provider("claude")
-            return True
+        for index, hotkey in enumerate(PROFILE_HOTKEYS):
+            # ``n`` keeps its established next-search-result meaning while a
+            # search is active; otherwise it can address the sixth profile.
+            if key == ord(hotkey) and index < len(self.profiles) and not (
+                hotkey == "n" and self.search_query
+            ):
+                self.select_profile(self.profiles[index].id)
+                return True
         if key == ord("p") and self.mode == "list":
             items = self.current_items()
             if items:
@@ -4499,9 +4593,6 @@ class TTYApp:
             return True
         if key in (ord("o"), ord("O")) and self.mode == "list":
             self.open_overall()
-            return True
-        if key == ord("x"):
-            self.select_provider("codex")
             return True
         if key in (27, curses.KEY_LEFT):
             if self.mode == "detail":
@@ -4585,7 +4676,12 @@ class TTYApp:
         body_height = max(1, height - 3)
         active_live = "[1] Live" if self.view == 1 else " 1  Live"
         active_history = "[2] History" if self.view == 2 else " 2  History"
-        source_tabs = "[z] Claude   x  Codex" if self.analysis.provider == "claude" else " z  Claude  [x] Codex"
+        active_profile = session_profile_id(self.path, self.profiles)
+        source_tabs = "  ".join(
+            f"[{key}] {profile.label}"
+            if profile.id == active_profile else f" {key}  {profile.label}"
+            for key, profile in zip(PROFILE_HOTKEYS, self.profiles)
+        )
         header_left = f" Execution Profiler   {active_live}  {active_history}"
         gap = max(2, width - 1 - len(header_left) - len(source_tabs))
         header = truncate_layout(header_left + " " * gap + source_tabs, width - 1)
@@ -4794,6 +4890,10 @@ class TTYApp:
                     width,
                 )
         elif self.mode == "help":
+            profile_lines = [
+                f"{key:<11} {profile.label} sessions"
+                for key, profile in zip(PROFILE_HOTKEYS, self.profiles)
+            ]
             lines = [
                 "Help",
                 "",
@@ -4804,8 +4904,7 @@ class TTYApp:
                 "← / Esc     Back one level",
                 "[           Previous session",
                 "]           Next session",
-                "z           Claude sessions",
-                "x           Codex sessions",
+                *profile_lines,
                 "p           Spawned background agents for this session",
                 "o / O       Overall consumption page (all discovered sessions)",
                 "d / D       Detach this view to a loopback browser dashboard / stop it",
@@ -4948,6 +5047,7 @@ def print_session_list(limit: int) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Live TTY execution profiler for Claude Code and Codex JSONL sessions.")
+    parser.add_argument("-v", "--version", action="version", version=f"agent-monitor {VERSION}")
     parser.add_argument("target", nargs="?", help="Session JSONL or project directory")
     parser.add_argument("--list", action="store_true", help="List recent sessions")
     parser.add_argument("--list-limit", type=int, default=20)

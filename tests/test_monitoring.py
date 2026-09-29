@@ -215,6 +215,36 @@ class SessionDiscoveryTests(unittest.TestCase):
         """)
         return connection
 
+    def test_profiles_are_discovered_in_per_machine_hotkey_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            claude = home / ".claude" / "projects"
+            primary = home / ".codex" / "sessions"
+            second = home / ".codex-the-second" / "sessions"
+            work = home / ".codex-work" / "sessions"
+            for path in (claude, primary, second, work):
+                path.mkdir(parents=True)
+
+            with (
+                mock.patch.object(monitoring.Path, "home", return_value=home),
+                mock.patch.object(monitoring, "default_projects_dir", return_value=claude),
+                mock.patch.object(monitoring, "default_codex_sessions_dir", return_value=primary),
+                mock.patch.dict(os.environ, {"CODEX_HOME": ""}, clear=False),
+            ):
+                profiles = monitoring.discover_session_profiles()
+
+            self.assertEqual(
+                [(key, profile.label) for key, profile in zip(monitoring.PROFILE_HOTKEYS, profiles)],
+                [("z", "Claude"), ("x", "Codex"), ("c", "2nd"), ("v", "Work")],
+            )
+
+    def test_short_version_flag_prints_release_version_without_a_tty(self):
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "monitoring.py"), "-v"],
+            check=True, capture_output=True, text=True,
+        )
+        self.assertEqual(result.stdout.strip(), f"agent-monitor {monitoring.VERSION}")
+
     def test_codex_chats_follow_recency_and_current_rollout_path(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1035,9 +1065,12 @@ class FrameAffordanceTests(unittest.TestCase):
         finally:
             fixture.close()
 
-    def test_z_x_filter_provider_and_return_to_previous_session(self):
+    def test_profile_hotkeys_filter_storage_profiles_and_restore_positions(self):
         claude = SessionFixture([prompt()])
         codex = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".jsonl", prefix="rollout-", delete=False, encoding="utf-8",
+        )
+        second = tempfile.NamedTemporaryFile(
             mode="w", suffix=".jsonl", prefix="rollout-", delete=False, encoding="utf-8",
         )
         class Screen:
@@ -1046,25 +1079,58 @@ class FrameAffordanceTests(unittest.TestCase):
         try:
             for record in codex_records():
                 codex.write(json.dumps(record) + "\n")
+                second.write(json.dumps(record) + "\n")
             codex.close()
+            second.close()
             app = monitoring.TTYApp(Screen(), claude.path)
-            app.all_session_paths = [claude.path, codex.name]
-            app.session_paths = [claude.path]
+            app.profiles = [
+                monitoring.SessionProfile("claude", "Claude", "claude", Path(claude.path).parent),
+                monitoring.SessionProfile("codex", "Codex", "codex", Path(codex.name).parent),
+                monitoring.SessionProfile("codex:second", "2nd", "codex", Path(second.name).parent),
+            ]
+            # The fixtures share /tmp, so give each synthetic profile an exact
+            # parent directory before exercising the real path classifier.
+            roots = []
+            for profile, source in zip(app.profiles, (claude.path, codex.name, second.name)):
+                root = Path(tempfile.mkdtemp())
+                target = root / Path(source).name
+                target.write_bytes(Path(source).read_bytes())
+                roots.append((root, str(target)))
+            app.profiles = [
+                monitoring.SessionProfile(profile.id, profile.label, profile.provider, root)
+                for profile, (root, _) in zip(app.profiles, roots)
+            ]
+            claude_path, codex_path, second_path = (item[1] for item in roots)
+            app.path = claude_path
+            app.all_session_paths = [claude_path, codex_path, second_path]
+            app.session_paths = [claude_path]
             app.session_index = 0
-            app.provider_positions = {"claude": claude.path}
+            app.profile_positions = {"claude": claude_path}
             app.handle_key(ord("x"))
             self.assertEqual(app.analysis.provider, "codex")
-            self.assertEqual(app.path, codex.name)
-            self.assertEqual(app.session_paths, [codex.name])
+            self.assertEqual(app.path, codex_path)
+            self.assertEqual(app.session_paths, [codex_path])
+            app.handle_key(ord("c"))
+            self.assertEqual(app.analysis.provider, "codex")
+            self.assertEqual(app.path, second_path)
+            self.assertEqual(app.session_paths, [second_path])
             app.handle_key(ord("z"))
             self.assertEqual(app.analysis.provider, "claude")
-            self.assertEqual(app.path, claude.path)
-            self.assertEqual(app.session_paths, [claude.path])
+            self.assertEqual(app.path, claude_path)
+            self.assertEqual(app.session_paths, [claude_path])
         finally:
             claude.close()
             if not codex.closed:
                 codex.close()
-            os.unlink(codex.name)
+            if not second.closed:
+                second.close()
+            for root, path in locals().get("roots", []):
+                if Path(path).exists():
+                    Path(path).unlink()
+                root.rmdir()
+            for path in (codex.name, second.name):
+                if Path(path).exists():
+                    Path(path).unlink()
 
     def test_codex_session_renders_through_existing_list_and_detail_routes(self):
         session = tempfile.NamedTemporaryFile(
@@ -2186,8 +2252,19 @@ class DetachedDashboardTests(unittest.TestCase):
             def getmaxyx(self):
                 return 24, 120
 
+        dashboard_release = threading.Event()
+
+        def build_dashboard(cache, progress=None):
+            dashboard_release.wait(timeout=2)
+            return small_overall_report()
+
         try:
-            with mock.patch.dict(os.environ, {"AGENT_MONITOR_NO_BROWSER": "1"}):
+            with (
+                mock.patch.dict(os.environ, {"AGENT_MONITOR_NO_BROWSER": "1"}),
+                mock.patch.object(
+                    monitoring, "build_overall_report", side_effect=build_dashboard,
+                ),
+            ):
                 app = monitoring.TTYApp(Screen(), fixture.path)
                 app.refresh(force=True)
                 app.handle_key(ord("D"))
@@ -2200,6 +2277,7 @@ class DetachedDashboardTests(unittest.TestCase):
                 self.assertIn("building report in the background", app.transient_status)
                 self.assertIn("browser opening disabled", app.transient_status)
                 self.assertFalse(app.dashboard.status()["ready"])
+                dashboard_release.set()
                 app.dashboard.on_publish(1)
                 self.assertTrue(app.transient_status.startswith("Dashboard ready · http://127.0.0.1:"))
 
@@ -2221,4 +2299,5 @@ class DetachedDashboardTests(unittest.TestCase):
                 self.assertFalse(server.running)
                 self.assertEqual(app.transient_status, "Dashboard stopped")
         finally:
+            dashboard_release.set()
             fixture.close()

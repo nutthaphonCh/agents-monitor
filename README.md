@@ -13,8 +13,8 @@ All tools use the Python 3 standard library or macOS system commands. Agent cred
 ## Install from a release tar
 
 ```sh
-tar -xzf tools-0.3.1.tar.gz
-cd tools-0.3.1
+tar -xzf tools-0.3.2.tar.gz
+cd tools-0.3.2
 scripts/install.sh
 ```
 
@@ -25,27 +25,29 @@ scripts/install.sh --prefix /opt/nutthaphon-tools
 scripts/install.sh --check
 ```
 
-## Private GitHub bootstrap without cloning
+## Install from GitHub without cloning
 
-Create a fine-grained token with read-only Contents access to this repository. Download only the bootstrap script through the GitHub API, then let it fetch and verify the release tar:
+Download the public release tar and checksum, verify them, then install:
 
 ```sh
-read -s GITHUB_TOKEN
-export GITHUB_TOKEN
-curl --proto '=https' --tlsv1.2 --fail --location \
-  --netrc-file <(printf 'machine api.github.com\nlogin token\npassword %s\n' "$GITHUB_TOKEN") \
-  -H 'Accept: application/vnd.github.raw+json' \
-  -o /tmp/bootstrap-tools.sh \
-  'https://api.github.com/repos/nutthaphonCh/tools/contents/scripts/bootstrap-private-release.sh?ref=v0.3.1'
-chmod 700 /tmp/bootstrap-tools.sh
-/tmp/bootstrap-tools.sh --version 0.3.1
+curl --proto '=https' --tlsv1.2 --fail --location --remote-name-all \
+  https://github.com/nutthaphonCh/agents-monitor/releases/download/v0.3.2/{tools-0.3.2.tar.gz,SHA256SUMS}
+shasum -a 256 -c SHA256SUMS
+tar -xzf tools-0.3.2.tar.gz
+tools-0.3.2/scripts/install.sh
 ```
 
-The bootstrap keeps the token out of curl's argument list, downloads the release tar and checksum through the GitHub Contents API, verifies SHA-256, extracts into a temporary directory, and runs its installer. It does not create a Git checkout.
+The release archive contains no agent credentials or session data.
 
 ## Background processes
 
 Run `agent-monitor`, select a prompt in a Claude or Codex session, and press `p` to open every Claude, Codex, or AGY agent spawned by that prompt. Agents are scoped to both the selected session and prompt, grouped into active and finished sections, and ordinary yielded shell commands are excluded.
+
+Session profiles are discovered per machine. The monitor assigns the bottom-row
+keys `z`, `x`, `c`, `v`, `b`, `n`, `m` to the discovered profile array in order:
+Claude (when present), the default Codex profile, then isolated `.codex-*`
+profiles. For example, a machine with Claude, Codex, and Codex the 2nd shows
+`z Claude`, `x Codex`, `c 2nd`; another machine can have a different mapping.
 
 The list shows local started and finished times plus elapsed duration. Press Enter or Right Arrow for process detail. Tab switches between the realtime response, logs, and metadata; `f` toggles follow mode; Left Arrow returns to the process list.
 
@@ -84,5 +86,5 @@ The range switch (Today / 7d / 30d / 90d) and the unit switch (consumption score
 
 ```sh
 python3 -m unittest tests.test_monitoring
-scripts/build-release.sh 0.3.1
+scripts/build-release.sh 0.3.2
 ```
