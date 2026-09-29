@@ -13,8 +13,8 @@ All tools use the Python 3 standard library or macOS system commands. Agent cred
 ## Install from a release tar
 
 ```sh
-tar -xzf tools-0.3.2.tar.gz
-cd tools-0.3.2
+tar -xzf tools-0.3.3.tar.gz
+cd tools-0.3.3
 scripts/install.sh
 ```
 
@@ -31,10 +31,10 @@ Download the public release tar and checksum, verify them, then install:
 
 ```sh
 curl --proto '=https' --tlsv1.2 --fail --location --remote-name-all \
-  https://github.com/nutthaphonCh/agents-monitor/releases/download/v0.3.2/{tools-0.3.2.tar.gz,SHA256SUMS}
+  https://github.com/nutthaphonCh/agents-monitor/releases/download/v0.3.3/{tools-0.3.3.tar.gz,SHA256SUMS}
 shasum -a 256 -c SHA256SUMS
-tar -xzf tools-0.3.2.tar.gz
-tools-0.3.2/scripts/install.sh
+tar -xzf tools-0.3.3.tar.gz
+tools-0.3.3/scripts/install.sh
 ```
 
 The release archive contains no agent credentials or session data.
@@ -86,5 +86,5 @@ The range switch (Today / 7d / 30d / 90d) and the unit switch (consumption score
 
 ```sh
 python3 -m unittest tests.test_monitoring
-scripts/build-release.sh 0.3.2
+scripts/build-release.sh 0.3.3
 ```

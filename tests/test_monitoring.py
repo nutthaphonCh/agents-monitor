@@ -891,6 +891,27 @@ class TTYIntegrationTests(unittest.TestCase):
 
 
 class FrameAffordanceTests(unittest.TestCase):
+    def test_header_status_is_the_session_file_latest_change_time(self):
+        fixture = SessionFixture([prompt(), assistant_usage()])
+        changed_at = ts("2026-07-20T12:34:56Z")
+
+        class Screen:
+            def getmaxyx(self):
+                return 24, 120
+
+        try:
+            os.utime(fixture.path, (changed_at, changed_at))
+            app = monitoring.TTYApp(Screen(), fixture.path)
+            app.refresh(force=True)
+
+            self.assertEqual(
+                app.status,
+                monitoring.dt.datetime.fromtimestamp(changed_at).strftime("%H:%M:%S"),
+            )
+            self.assertTrue(app.session_header(120).endswith(f"· {app.status} · >"))
+        finally:
+            fixture.close()
+
     def test_chat_header_uses_navigation_arrows_instead_of_position_counts(self):
         app = object.__new__(monitoring.TTYApp)
         app.analysis = monitoring.Analysis(

@@ -64,7 +64,7 @@ from typing import Any, Callable
 
 REFRESH_INTERVAL = 0.5
 CACHE_SCHEMA_VERSION = 13
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 ESCAPE_DELAY_MS = 25
 ACTION_NAMES = (
     "WebSearch", "WebFetch", "Bash", "Write", "Edit", "Read", "Glob", "Grep", "Search",
@@ -4189,7 +4189,7 @@ class TTYApp:
                 self.cursor[2] = min(self.cursor[2], max(0, len(self.history) - 1))
                 self.last_record_count = self.analysis.record_count
                 self.last_mtime = mtime
-                self.status = dt.datetime.now().strftime("%H:%M:%S")
+                self.status = dt.datetime.fromtimestamp(mtime).strftime("%H:%M:%S")
         except OSError as exc:
             self.status = f"error: {exc}"
 
