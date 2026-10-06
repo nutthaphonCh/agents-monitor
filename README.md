@@ -13,8 +13,8 @@ All tools use the Python 3 standard library or macOS system commands. Agent cred
 ## Install from a release tar
 
 ```sh
-tar -xzf tools-0.3.3.tar.gz
-cd tools-0.3.3
+tar -xzf tools-0.3.4.tar.gz
+cd tools-0.3.4
 scripts/install.sh
 ```
 
@@ -31,10 +31,10 @@ Download the public release tar and checksum, verify them, then install:
 
 ```sh
 curl --proto '=https' --tlsv1.2 --fail --location --remote-name-all \
-  https://github.com/nutthaphonCh/agents-monitor/releases/download/v0.3.3/{tools-0.3.3.tar.gz,SHA256SUMS}
+  https://github.com/nutthaphonCh/agents-monitor/releases/download/v0.3.4/{tools-0.3.4.tar.gz,SHA256SUMS}
 shasum -a 256 -c SHA256SUMS
-tar -xzf tools-0.3.3.tar.gz
-tools-0.3.3/scripts/install.sh
+tar -xzf tools-0.3.4.tar.gz
+tools-0.3.4/scripts/install.sh
 ```
 
 The release archive contains no agent credentials or session data.
@@ -59,7 +59,7 @@ Request detail pairs each action with a bounded output preview. Press `y` to cop
 
 Press `o` (or `O`) from Live or History to open **Overall**, covering every discoverable Claude and Codex session active in the last 90 days. Raw volume is not presented as the ranking unit. Projects, providers, models, sessions, and the time trend all use one configurable consumption score: `fresh × 1.0 + cache-read × 0.1`. Here, fresh includes uncached input, cache creation, and output. This score is a comparison heuristic—not price, billing, or direct compute usage. Configure the weights with `AGENT_MONITOR_FRESH_WEIGHT` and `AGENT_MONITOR_CACHE_WEIGHT`. Projects are grouped by the session's full working directory (two directories that merely share a basename, such as `work/tools` and `lg/tools`, stay separate and are labelled with enough parent segments to tell apart), and a session launched from a Claude Code scratchpad directory is attributed to the project of the session that owns that scratchpad. Daily trend buckets and session dates use the viewer's local timezone, not UTC.
 
-The first scan runs in the background; animated progress lives in the bottom bar's global right-hand status area and remains visible from other views. Select a project with `Up`/`Down` and `Enter`/`Right`, then select one of its five highest-consumption sessions and jump to it the same way. `Esc`/`Left` restores the originating session and page. Session metadata shows latest and peak context plus the cache percentage aggregated across the complete logical session—not merely its latest request. Codex continuation shards with the same root thread ID are combined before scoring. Claude Code subagent transcripts (`<session>/subagents/agent-*.jsonl`) are read alongside the parent transcript and attributed to the prompt that spawned them via `promptId`, so sessions that fan out work to agents are not undercounted. Repeated Codex `token_count` snapshots whose cumulative total has not changed are treated as replays and counted once. File rankings use observed operation counts only and do not claim consumption attribution.
+The first scan runs in the background; animated progress lives in the bottom bar's global right-hand status area and remains visible from other views. Select a project with `Up`/`Down` and `Enter`/`Right`, then select one of its five highest-consumption sessions and jump to it the same way. `Esc`/`Left` restores the originating session and page. Session metadata shows latest and peak context plus the cache percentage aggregated across the complete logical session—not merely its latest request. Codex continuation shards with the same root thread ID are combined before scoring. Codex sub-agent rollouts are hidden from top-level session navigation and linked back to the parent prompt's `Sub-agents` drill-down. Claude Code subagent transcripts (`<session>/subagents/agent-*.jsonl`) are read alongside the parent transcript and attributed to the prompt that spawned them via `promptId`, so sessions that fan out work to agents are not undercounted. Repeated Codex `token_count` snapshots whose cumulative total has not changed are treated as replays and counted once. File rankings use observed operation counts only and do not claim consumption attribution.
 
 Search input uses the terminal's Unicode-aware character API, so `/` accepts Thai text. Enter `#<full-session-id>` and press `Enter` to resolve that exact logical session across Claude and Codex and open its first prompt detail immediately. A unique ID prefix, full rollout filename, or shortened rollout display ID is accepted as well. `Esc`/`Left` from a search jump restores the page and session where the search began.
 
@@ -86,5 +86,5 @@ The range switch (Today / 7d / 30d / 90d) and the unit switch (consumption score
 
 ```sh
 python3 -m unittest tests.test_monitoring
-scripts/build-release.sh 0.3.3
+scripts/build-release.sh 0.3.4
 ```

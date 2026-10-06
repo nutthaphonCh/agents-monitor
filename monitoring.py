@@ -63,8 +63,8 @@ from typing import Any, Callable
 
 
 REFRESH_INTERVAL = 0.5
-CACHE_SCHEMA_VERSION = 13
-VERSION = "0.3.3"
+CACHE_SCHEMA_VERSION = 15
+VERSION = "0.3.4"
 ESCAPE_DELAY_MS = 25
 ACTION_NAMES = (
     "WebSearch", "WebFetch", "Bash", "Write", "Edit", "Read", "Glob", "Grep", "Search",
@@ -184,6 +184,10 @@ class SubSession:
     label: str
     first_sequence: int
     usage: Usage = field(default_factory=Usage)
+    status: str = "observed"
+    thread_id: str | None = None
+    path: str | None = None
+    analysis: Analysis | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -460,6 +464,34 @@ def codex_session_metadata(path: str) -> tuple[str, str] | None:
     return chat_id, source if isinstance(source, str) else ""
 
 
+def codex_subagent_metadata(path: str) -> dict[str, Any] | None:
+    """Return normalized parent/link metadata for a Codex sub-agent rollout."""
+    try:
+        with Path(path).open(encoding="utf-8") as session_file:
+            record = json.loads(session_file.readline())
+    except (OSError, json.JSONDecodeError):
+        return None
+    payload = record.get("payload") if isinstance(record, dict) else None
+    if not isinstance(payload, dict) or payload.get("thread_source") != "subagent":
+        return None
+    source = payload.get("source")
+    subagent = source.get("subagent") if isinstance(source, dict) else None
+    spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+    if not isinstance(spawn, dict):
+        spawn = {}
+    thread_id = payload.get("id")
+    parent_id = spawn.get("parent_thread_id") or payload.get("session_id")
+    if not isinstance(thread_id, str) or not thread_id or not isinstance(parent_id, str) or not parent_id:
+        return None
+    return {
+        "thread_id": thread_id,
+        "parent_thread_id": parent_id,
+        "agent_path": str(spawn.get("agent_path") or ""),
+        "agent_nickname": str(spawn.get("agent_nickname") or ""),
+        "depth": int(spawn.get("depth") or 0),
+    }
+
+
 def fallback_codex_chats(sessions_dir: Path | None = None) -> list[tuple[float, str]]:
     """Discover one latest user-facing rollout per chat without the state DB."""
     root = sessions_dir or default_codex_sessions_dir()
@@ -472,7 +504,7 @@ def fallback_codex_chats(sessions_dir: Path | None = None) -> list[tuple[float, 
             chat_id, source = path, ""
         else:
             chat_id, source = metadata
-        if source == "subagent":
+        if source == "subagent" or codex_subagent_metadata(path):
             continue
         modified = os.path.getmtime(path)
         current = chats.get(chat_id)
@@ -497,6 +529,7 @@ def codex_chats(profile: SessionProfile | None = None) -> list[tuple[float, str]
                        updated_at_ms, updated_at, created_at_ms, created_at
                 FROM threads
                 WHERE archived = 0
+                  AND COALESCE(thread_source, '') != 'subagent'
                   AND (thread_source = 'user' OR has_user_event = 1)
                 """
             ).fetchall()
@@ -508,7 +541,10 @@ def codex_chats(profile: SessionProfile | None = None) -> list[tuple[float, str]
     chats: list[tuple[float, str]] = []
     seen: set[str] = set()
     for path, recency_ms, recency, updated_ms, updated, created_ms, created in rows:
-        if not isinstance(path, str) or path in seen or not Path(path).is_file():
+        if (
+            not isinstance(path, str) or path in seen or not Path(path).is_file()
+            or codex_subagent_metadata(path)
+        ):
             continue
         seen.add(path)
         timestamp = next(
@@ -1750,6 +1786,7 @@ class CodexSessionAnalyzer:
         self.sequence = 0
         self.partial = ""
         self.model = "codex"
+        self.thread_source = ""
         self.pending_actions: list[str] = []
         self.pending_action_details: list[str] = []
         self.pending_action_outputs: list[str] = []
@@ -1798,6 +1835,9 @@ class CodexSessionAnalyzer:
         kind = str(payload.get("type") or "")
         timestamp = rec.get("timestamp")
         if rec.get("type") == "session_meta":
+            source = str(payload.get("thread_source") or "")
+            if source == "subagent" or not self.thread_source:
+                self.thread_source = source
             system_payload = str(payload.get("base_instructions") or "")
             dynamic_tools = payload.get("dynamic_tools")
             if dynamic_tools:
@@ -1810,9 +1850,50 @@ class CodexSessionAnalyzer:
             return
         if kind == "item_completed":
             item = payload.get("item")
-            if not isinstance(item, dict) or str(item.get("type") or "").lower() != "usermessage":
+            item_type = str(item.get("type") or "").lower() if isinstance(item, dict) else ""
+            if item_type == "subagentactivity":
+                thread_id = str(item.get("agent_thread_id") or "")
+                prompt = next(
+                    (candidate for candidate in self.analysis.prompts
+                     if thread_id in candidate.sub_sessions),
+                    self.analysis.prompts[-1] if self.analysis.prompts else None,
+                )
+                if not prompt or not thread_id:
+                    return
+                activity = str(item.get("kind") or "observed").lower()
+                agent_path = str(item.get("agent_path") or "")
+                label = agent_path.rsplit("/", 1)[-1] or thread_id
+                sub = prompt.sub_sessions.get(thread_id)
+                if sub is None:
+                    sub = SubSession(
+                        thread_id, label, self.sequence,
+                        status="running" if activity == "started" else activity,
+                        thread_id=thread_id,
+                    )
+                    prompt.sub_sessions[thread_id] = sub
+                elif activity == "completed":
+                    sub.status = "completed"
+                elif activity == "started":
+                    sub.status = "running"
+                if activity in {"started", "completed"}:
+                    prompt.timeline.append(TimelineItem(
+                        timestamp, f"Sub-agent · {sub.label} — {sub.status}", "subagent",
+                    ))
+                return
+            if item_type != "usermessage":
                 return
             payload = {"type": "user_message", "message": codex_message_text(item)}
+            kind = "user_message"
+        if (
+            kind == "message" and str(payload.get("role") or "") == "user"
+            and self.thread_source == "subagent"
+        ):
+            message = codex_message_text(payload)
+            if message.lstrip().startswith("# AGENTS.md instructions"):
+                # The actual NEW_TASK payload is encrypted; this plaintext user-role
+                # message is repository guidance, not the delegated request itself.
+                message = "Sub-agent task (encrypted)"
+            payload = {"type": "user_message", "message": message}
             kind = "user_message"
         if kind == "message" and str(payload.get("role") or "") == "developer":
             text = codex_message_text(payload)
@@ -2079,6 +2160,7 @@ class ProfilerCache:
                 analyzer.model = str(state.get("model") or (
                     analysis.prompts[-1].main.primary_model if analysis.prompts else "codex"
                 ))
+                analyzer.thread_source = str(state.get("thread_source") or "")
                 analyzer.pending_actions = list(state.get("pending_actions") or [])
                 analyzer.pending_action_details = list(state.get("pending_action_details") or [])
                 analyzer.pending_action_outputs = list(state.get("pending_action_outputs") or [])
@@ -2118,6 +2200,7 @@ class ProfilerCache:
             "partial": analyzer.partial,
             "tools": tools,
             "model": getattr(analyzer, "model", None),
+            "thread_source": getattr(analyzer, "thread_source", None),
             "pending_actions": getattr(analyzer, "pending_actions", []),
             "pending_action_details": getattr(analyzer, "pending_action_details", []),
             "pending_action_outputs": getattr(analyzer, "pending_action_outputs", []),
@@ -2457,11 +2540,12 @@ def live_feed(analysis: Analysis) -> list[tuple[int, str]]:
             state = "running" if session_is_live else "last observed"
         else:
             state = "completed"
+        subagents = f" · {len(prompt.sub_sessions)} sub-agents" if prompt.sub_sessions else ""
         items.append((prompt.index, (
             f"       {state} · {fmt_tokens(latest_context_size(prompt))} context "
             f"({latest_context_usage(prompt).cache_hit_rate:.0f}% cached) · "
             f"{fmt_tokens(usage.output)} out · "
-            f"{usage.requests} thinking rounds"
+            f"{usage.requests} thinking rounds{subagents}"
         )))
     return items
 
@@ -2473,11 +2557,12 @@ def history_feed(analysis: Analysis) -> list[tuple[int, str]]:
         usage = prompt.total_usage
         quoted_prompt = json.dumps(prompt.prompt, ensure_ascii=False)
         text = f"{prompt.index:>{index_width}} | {timestamp_hm(prompt.timestamp)} · {quoted_prompt}"
+        subagents = f" · {len(prompt.sub_sessions)} sub-agents" if prompt.sub_sessions else ""
         items.append((prompt.index, (
             f"{text}  ·  {fmt_tokens(latest_context_size(prompt))} context "
             f"({latest_context_usage(prompt).cache_hit_rate:.0f}% cached) · "
             f"{fmt_tokens(usage.output)} out · "
-            f"{usage.requests} thinking rounds"
+            f"{usage.requests} thinking rounds{subagents}"
         )))
     return items
 
@@ -2671,7 +2756,10 @@ def project_session_line_indices(lines: list[str]) -> list[int]:
     ]
 
 
-DETAIL_SECTIONS = ("Actors", "Timeline", "Files", "Requests", "Context attribution", "Usage observation")
+DETAIL_SECTIONS = (
+    "Actors", "Timeline", "Files", "Requests", "Context attribution",
+    "Usage observation", "Sub-agents",
+)
 
 
 def context_attribution(prompt: PromptTurn) -> list[tuple[str, int]]:
@@ -2749,6 +2837,7 @@ def prompt_overview_lines(prompt: PromptTurn, width: int) -> list[str]:
         (
             f"  Work      {len(prompt.requests)} thinking rounds · "
             f"{len(prompt.timeline)} events · {len(prompt.files)} file ops"
+            + (f" · {len(prompt.sub_sessions)} sub-agents" if prompt.sub_sessions else "")
         ),
         "",
         f"Actors                 {len(prompt.actors) + (1 if prompt.main.total else 0)}",
@@ -2757,6 +2846,7 @@ def prompt_overview_lines(prompt: PromptTurn, width: int) -> list[str]:
         f"Requests               {len(prompt.requests)}",
         f"Context attribution    {fmt_tokens(latest_context_size(prompt))} current",
         f"Usage observation      {len(prompt.usage_observations)} captured",
+        f"Sub-agents             {len(prompt.sub_sessions)}",
     ]
 
 
@@ -2769,6 +2859,27 @@ def section_line_indices(lines: list[str]) -> list[int]:
 
 def request_line_indices(lines: list[str]) -> list[int]:
     return [index for index, line in enumerate(lines) if re.match(r"^\s*\d+\s+\|", line)]
+
+
+def sub_session_usage(sub: SubSession) -> Usage:
+    return sub.analysis.total_usage if sub.analysis is not None else sub.usage
+
+
+def subagent_detail_lines(sub: SubSession, width: int) -> list[str]:
+    usage = sub_session_usage(sub)
+    lines = [
+        sub.label, "",
+        f"Status       {sub.status}",
+        f"Thread       {sub.thread_id or sub.key}",
+        f"Context      {fmt_tokens(usage.context_total)} ({usage.cache_hit_rate:.0f}% cached)",
+        f"Output       {fmt_tokens(usage.output)}",
+        f"Rounds       {usage.requests}",
+    ]
+    if sub.analysis is not None:
+        lines.extend(["", f"Prompts      {len(sub.analysis.prompts)}"])
+        for prompt in sub.analysis.prompts:
+            lines.append(f"  {prompt.index} | {timestamp_hm(prompt.timestamp)} · {truncate(prompt.prompt, max(10, width - 18))}")
+    return lines
 
 
 def wrapped_prefixed_lines(
@@ -3296,7 +3407,10 @@ def prompt_detail_payload(prompt: PromptTurn, position: int, shard: str, status:
         "main_actor": main_actor_name(prompt) if prompt.main.total else None,
         "main": usage_payload(prompt.main),
         "sub_sessions": [
-            {"key": sub.key, "label": sub.label, "usage": usage_payload(sub.usage)}
+            {
+                "key": sub.key, "label": sub.label, "status": sub.status,
+                "thread_id": sub.thread_id, "usage": usage_payload(sub_session_usage(sub)),
+            }
             for sub in prompt.sub_sessions.values()
         ],
         "actors": [actor_payload(actor) for actor in prompt.actors],
@@ -3340,6 +3454,72 @@ def load_session_analyses(path: str, cache: ProfilerCache | None) -> list[tuple[
     return analyses
 
 
+def codex_subagent_paths(parent_path: str, thread_ids: set[str]) -> dict[str, str]:
+    """Resolve child thread IDs without promoting their rollouts into the session catalog."""
+    if not thread_ids:
+        return {}
+    root = next(
+        (profile.sessions_dir for profile in discover_session_profiles()
+         if profile.provider == "codex" and profile.sessions_dir in Path(parent_path).parents),
+        Path(parent_path).parent,
+    )
+    found: dict[str, str] = {}
+    state_db = root.parent / "state_5.sqlite"
+    try:
+        connection = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True)
+        try:
+            placeholders = ",".join("?" for _ in thread_ids)
+            rows = connection.execute(
+                f"SELECT id, rollout_path FROM threads WHERE id IN ({placeholders})",
+                tuple(thread_ids),
+            ).fetchall()
+        finally:
+            connection.close()
+        for thread_id, rollout_path in rows:
+            if thread_id in thread_ids and isinstance(rollout_path, str) and Path(rollout_path).is_file():
+                found[thread_id] = rollout_path
+    except (OSError, sqlite3.Error):
+        pass
+
+    for thread_id in thread_ids - found.keys():
+        candidates = list(Path(parent_path).parent.glob(f"*{thread_id}*.jsonl"))
+        if not candidates and root != Path(parent_path).parent:
+            candidates = list(root.glob(f"**/*{thread_id}*.jsonl"))
+        if candidates:
+            found[thread_id] = str(max(candidates, key=lambda item: item.stat().st_mtime_ns))
+    return found
+
+
+def attach_codex_subagents(
+    prompts: list[PromptTurn], parent_path: str, cache: ProfilerCache | None,
+) -> None:
+    """Hydrate parent prompt placeholders from their hidden child rollout files."""
+    thread_ids = {
+        sub.thread_id or sub.key
+        for prompt in prompts for sub in prompt.sub_sessions.values()
+        if sub.thread_id or sub.key
+    }
+    for thread_id, child_path in codex_subagent_paths(parent_path, thread_ids).items():
+        sub = next(
+            (item for prompt in prompts for item in prompt.sub_sessions.values()
+             if (item.thread_id or item.key) == thread_id),
+            None,
+        )
+        if sub is None:
+            continue
+        try:
+            child = (cache.analyzer(child_path) if cache else create_analyzer(child_path)).analysis
+        except (OSError, sqlite3.Error):
+            continue
+        metadata = codex_subagent_metadata(child_path) or {}
+        nickname = str(metadata.get("agent_nickname") or "")
+        agent_path = str(metadata.get("agent_path") or "")
+        task_name = agent_path.rsplit("/", 1)[-1]
+        sub.label = " · ".join(part for part in (task_name, nickname) if part) or sub.label
+        sub.path = child_path
+        sub.analysis = copy.deepcopy(child)
+
+
 def merged_session_analysis(
     path: str, cache: ProfilerCache | None = None,
     current_analyzer: IncrementalSessionAnalyzer | CodexSessionAnalyzer | None = None,
@@ -3372,6 +3552,7 @@ def merged_session_analysis(
             prompt = copy.deepcopy(source_prompt)
             prompt.index = len(prompts) + 1
             prompts.append(prompt)
+    attach_codex_subagents(prompts, path, cache)
     return Analysis(path, prompts, preamble, malformed, record_count, provider="codex")
 
 
@@ -3737,6 +3918,22 @@ def detail_page_lines(prompt: PromptTurn, page: str, width: int) -> list[str]:
             "Confidence",
             f"  {observation.confidence}" + (f" · {observation.confidence_reason}" if observation.confidence_reason else ""),
         ]
+    if page == "subagents":
+        lines = ["Sub-agents", ""]
+        for index, sub in enumerate(prompt.sub_sessions.values(), 1):
+            usage = sub_session_usage(sub)
+            lines.append(
+                f"{index} | {sub.status:<9} · {truncate(sub.label, max(12, width - 48))} · "
+                f"{fmt_tokens(usage.output)} out · {usage.requests} rounds"
+            )
+        return lines if prompt.sub_sessions else ["Sub-agents", "", "No sub-agents in this prompt."]
+    if page.startswith("subagent:"):
+        try:
+            subagent_index = int(page.split(":", 1)[1])
+            sub = list(prompt.sub_sessions.values())[subagent_index]
+        except (ValueError, IndexError):
+            return ["Sub-agent not found"]
+        return subagent_detail_lines(sub, width)
     return ["Unknown detail page"]
 
 
@@ -4254,7 +4451,9 @@ class TTYApp:
         if not prompt:
             return
         if self.detail_page == "prompt":
-            self.detail_page = ("actors", "timeline", "files", "requests", "context", "usage")[self.detail_cursor]
+            self.detail_page = (
+                "actors", "timeline", "files", "requests", "context", "usage", "subagents",
+            )[self.detail_cursor]
             self.detail_cursor = 0
             self.detail_offset = 0
         elif self.detail_page == "actors" and (prompt.actors or prompt.main.total):
@@ -4271,12 +4470,18 @@ class TTYApp:
             self.detail_page = f"request:{self.detail_cursor}"
             self.detail_offset = 0
             self.clipboard_notice = ""
+        elif self.detail_page == "subagents" and prompt.sub_sessions:
+            self.detail_cursor = min(self.detail_cursor, len(prompt.sub_sessions) - 1)
+            self.detail_page = f"subagent:{self.detail_cursor}"
+            self.detail_offset = 0
 
     def back_detail(self) -> None:
         if self.detail_page.startswith("actor:"):
             self.detail_page = "actors"
         elif self.detail_page.startswith("request:"):
             self.detail_page = "requests"
+        elif self.detail_page.startswith("subagent:"):
+            self.detail_page = "subagents"
         elif self.detail_page != "prompt":
             self.detail_page = "prompt"
             self.detail_cursor = 0
@@ -4610,7 +4815,7 @@ class TTYApp:
                 self.set_status_area(self.clipboard_notice.capitalize())
                 return True
             if self.detail_page == "prompt":
-                if key == curses.KEY_DOWN: self.detail_cursor = min(5, self.detail_cursor + 1)
+                if key == curses.KEY_DOWN: self.detail_cursor = min(6, self.detail_cursor + 1)
                 elif key == curses.KEY_UP: self.detail_cursor = max(0, self.detail_cursor - 1)
             elif self.detail_page == "actors" and prompt:
                 actor_count = len(prompt.actors) + (1 if prompt.main.total else 0)
@@ -4618,6 +4823,9 @@ class TTYApp:
                 elif key == curses.KEY_UP: self.detail_cursor = max(0, self.detail_cursor - 1)
             elif self.detail_page == "requests" and prompt:
                 if key == curses.KEY_DOWN: self.detail_cursor = min(max(0, len(prompt.requests) - 1), self.detail_cursor + 1)
+                elif key == curses.KEY_UP: self.detail_cursor = max(0, self.detail_cursor - 1)
+            elif self.detail_page == "subagents" and prompt:
+                if key == curses.KEY_DOWN: self.detail_cursor = min(max(0, len(prompt.sub_sessions) - 1), self.detail_cursor + 1)
                 elif key == curses.KEY_UP: self.detail_cursor = max(0, self.detail_cursor - 1)
             else:
                 if key == curses.KEY_DOWN: self.detail_offset += 1
@@ -4847,6 +5055,7 @@ class TTYApp:
                 lines = detail_page_lines(prompt, self.detail_page, width - 2) if prompt else ["Prompt not found"]
             prompt_sections = section_line_indices(lines) if self.detail_page == "prompt" else []
             request_lines = request_line_indices(lines) if self.detail_page == "requests" else []
+            subagent_lines = request_line_indices(lines) if self.detail_page == "subagents" else []
             max_offset = max(0, len(lines) - body_height)
             self.detail_offset = min(self.detail_offset, max_offset)
             selected_line = None
@@ -4856,6 +5065,8 @@ class TTYApp:
                 selected_line = self.detail_cursor + 2
             elif self.detail_page == "requests" and request_lines:
                 selected_line = request_lines[min(self.detail_cursor, len(request_lines) - 1)]
+            elif self.detail_page == "subagents" and subagent_lines:
+                selected_line = subagent_lines[min(self.detail_cursor, len(subagent_lines) - 1)]
             if selected_line is not None:
                 if selected_line < self.detail_offset:
                     self.detail_offset = selected_line
@@ -4869,11 +5080,14 @@ class TTYApp:
                     selectable = line_index - 2 == self.detail_cursor
                 elif self.detail_page == "requests" and line_index in request_lines:
                     selectable = request_lines.index(line_index) == self.detail_cursor
+                elif self.detail_page == "subagents" and line_index in subagent_lines:
+                    selectable = subagent_lines.index(line_index) == self.detail_cursor
                 attr = curses.A_REVERSE if selectable else (curses.A_BOLD if line_index == 0 else 0)
                 enterable = (
                     (self.detail_page == "prompt" and line_index in prompt_sections)
                     or (self.detail_page == "actors" and line_index >= 2)
                     or (self.detail_page == "requests" and line_index in request_lines)
+                    or (self.detail_page == "subagents" and line_index in subagent_lines)
                 )
                 prefix = "> " if enterable else "  "
                 rows.append((prefix + truncate_layout(line, width - len(prefix) - 1), attr))

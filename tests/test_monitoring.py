@@ -264,7 +264,8 @@ class SessionDiscoveryTests(unittest.TestCase):
                 [
                     ("chat-one", str(current_shard), 100_000, "user", 1),
                     ("chat-two", str(newer_chat), 200_000, "user", 1),
-                    ("worker", str(subagent), 300_000, "subagent", 0),
+                    # Sub-agent rollouts can contain a synthetic user event; source wins.
+                    ("worker", str(subagent), 300_000, "subagent", 1),
                 ],
             )
             connection.commit()
@@ -1656,6 +1657,78 @@ class OverallPageTests(unittest.TestCase):
             self.assertEqual([prompt.index for prompt in analysis.prompts], [1, 2])
             self.assertEqual(analysis.record_count, len(codex_records()) * 2)
             self.assertEqual(len(monitoring.history_feed(analysis)), 2)
+
+    def test_codex_subagent_is_attached_to_parent_prompt_and_drills_down(self):
+        parent_id = "01a06201-c11e-7430-9dc1-57700eb22393"
+        child_id = "01a06202-a111-7000-8000-111111111111"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            parent = Path(tmp_dir) / f"rollout-parent-{parent_id}.jsonl"
+            child = Path(tmp_dir) / f"rollout-child-{child_id}.jsonl"
+            parent_records = codex_records()
+            parent_records[0]["payload"].update({
+                "id": parent_id, "session_id": parent_id, "thread_source": "user",
+            })
+            parent_records.insert(4, {
+                "type": "event_msg", "timestamp": "2026-07-20T10:00:01.5Z", "payload": {
+                    "type": "item_completed", "turn_id": "turn-1", "item": {
+                        "type": "SubAgentActivity", "kind": "started",
+                        "agent_thread_id": child_id, "agent_path": "/root/code_review",
+                    },
+                },
+            })
+            parent_records.insert(5, {
+                "type": "event_msg", "timestamp": "2026-07-20T10:00:03.5Z", "payload": {
+                    "type": "item_completed", "turn_id": "turn-1", "item": {
+                        "type": "SubAgentActivity", "kind": "completed",
+                        "agent_thread_id": child_id, "agent_path": "/root/code_review",
+                    },
+                },
+            })
+            parent.write_text("".join(json.dumps(item) + "\n" for item in parent_records), encoding="utf-8")
+
+            child_records = codex_records()
+            child_records[0]["payload"] = {
+                "id": child_id, "session_id": parent_id, "thread_source": "subagent",
+                "source": {"subagent": {"thread_spawn": {
+                    "parent_thread_id": parent_id, "depth": 1,
+                    "agent_path": "/root/code_review", "agent_nickname": "Ada",
+                }}},
+            }
+            child_records[3] = {
+                "type": "response_item", "timestamp": "2026-07-20T10:00:01Z", "payload": {
+                    "type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": "# AGENTS.md instructions for /repo"}],
+                },
+            }
+            child.write_text("".join(json.dumps(item) + "\n" for item in child_records), encoding="utf-8")
+
+            with mock.patch.object(
+                monitoring, "codex_subagent_paths", return_value={child_id: str(child)},
+            ):
+                analysis = monitoring.merged_session_analysis(str(parent))
+
+            turn = analysis.prompts[0]
+            self.assertEqual(list(turn.sub_sessions), [child_id])
+            sub = turn.sub_sessions[child_id]
+            self.assertEqual((sub.label, sub.status), ("code_review · Ada", "completed"))
+            self.assertEqual(sub.analysis.prompts[0].prompt, "Sub-agent task (encrypted)")
+            self.assertIn("1 sub-agents", monitoring.history_feed(analysis)[0][1])
+            self.assertIn("Sub-agents             1", monitoring.prompt_overview_lines(turn, 100))
+            listing = monitoring.detail_page_lines(turn, "subagents", 100)
+            self.assertTrue(any("code_review · Ada" in line and "5 out" in line for line in listing))
+            detail = monitoring.detail_page_lines(turn, "subagent:0", 100)
+            self.assertIn("Prompts      1", detail)
+            self.assertTrue(any("Sub-agent task (encrypted)" in line for line in detail))
+
+            app = object.__new__(monitoring.TTYApp)
+            app.analysis, app.selected_prompt = analysis, 1
+            app.detail_page, app.detail_cursor, app.detail_offset = "prompt", 6, 0
+            app.open_detail_selection()
+            self.assertEqual(app.detail_page, "subagents")
+            app.open_detail_selection()
+            self.assertEqual(app.detail_page, "subagent:0")
+            app.back_detail()
+            self.assertEqual(app.detail_page, "subagents")
 
     def test_codex_rollout_display_id_strips_each_uuid_tail(self):
         root = "rollout-2026-09-03T16-30-06-01a0669a-a7a5-71f1-8431-59a6fa3c6ce0"
