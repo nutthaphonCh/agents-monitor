@@ -22,6 +22,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import monitoring  # noqa: E402
+from agent_monitor import tui, views  # noqa: E402
 sys.path.insert(0, str(ROOT / "tools"))
 import codex_telemetry  # noqa: E402
 
@@ -236,6 +237,7 @@ class SelfUpdateTests(unittest.TestCase):
                 mock.patch.object(monitoring, "latest_release_assets", return_value=(version, assets)),
                 mock.patch.object(monitoring, "release_request", side_effect=fetch),
                 mock.patch.object(monitoring.subprocess, "run") as run,
+                mock.patch.object(sys, "stdout", io.StringIO()),
             ):
                 prefix = Path(directory) / "prefix"
                 monitoring.update_agent_monitor(prefix=prefix)
@@ -448,7 +450,7 @@ class SessionDiscoveryTests(unittest.TestCase):
             app.session_paths = [current.path, older.path]
             app.session_index = 0
             with mock.patch.object(
-                monitoring, "find_all_sessions",
+                tui, "find_all_sessions",
                 return_value=[newer.path, current.path, older.path],
             ):
                 app.handle_key(ord("["))
@@ -1867,8 +1869,8 @@ class OverallPageTests(unittest.TestCase):
                 self.assertIsNotNone(app.overall_report)
 
                 with (
-                    mock.patch.object(monitoring, "write_overall_report", return_value=(True, "saved /tmp/x.html")) as write,
-                    mock.patch.object(monitoring, "open_overall_report", return_value=(True, "opened in browser · /tmp/x.html")) as open_report,
+                    mock.patch.object(tui, "write_overall_report", return_value=(True, "saved /tmp/x.html")) as write,
+                    mock.patch.object(tui, "open_overall_report", return_value=(True, "opened in browser · /tmp/x.html")) as open_report,
                 ):
                     app.handle_key(ord("p"))
                     write.assert_called_once_with(app.overall_report)
@@ -1888,8 +1890,8 @@ class OverallPageTests(unittest.TestCase):
                 self.assertEqual(app.mode, "overall")
 
                 with (
-                    mock.patch.object(monitoring, "write_overall_report", return_value=(True, "saved again")) as write,
-                    mock.patch.object(monitoring, "open_overall_report", return_value=(True, "opened again")),
+                    mock.patch.object(tui, "write_overall_report", return_value=(True, "saved again")) as write,
+                    mock.patch.object(tui, "open_overall_report", return_value=(True, "opened again")),
                 ):
                     app.handle_key(ord("P"))
                     write.assert_called_once_with(app.overall_report)
@@ -1922,7 +1924,7 @@ class OverallPageTests(unittest.TestCase):
 
         try:
             app = monitoring.TTYApp(Screen(), fixture.path)
-            with mock.patch.object(monitoring, "build_overall_report", side_effect=slow_report):
+            with mock.patch.object(tui, "build_overall_report", side_effect=slow_report):
                 app.handle_key(ord("o"))
                 self.assertTrue(started.wait(timeout=1))
                 self.assertEqual(app.overall_load_state, "loading")
@@ -2136,7 +2138,7 @@ class OverallPageTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmp_dir:
             target = Path(tmp_dir) / "nested" / "overall-report.html"
-            with mock.patch.object(monitoring, "default_overall_report_path", return_value=target):
+            with mock.patch.object(views, "default_overall_report_path", return_value=target):
                 ok, message = monitoring.write_overall_report(report)
             self.assertTrue(ok)
             self.assertIn(str(target), message)
@@ -2144,7 +2146,7 @@ class OverallPageTests(unittest.TestCase):
             self.assertIn("<!doctype html>", target.read_text())
 
         with (
-            mock.patch.object(monitoring, "default_overall_report_path", return_value=Path("/no/such/dir/report.html")),
+            mock.patch.object(views, "default_overall_report_path", return_value=Path("/no/such/dir/report.html")),
             mock.patch.object(Path, "mkdir", side_effect=OSError("denied")),
         ):
             ok, message = monitoring.write_overall_report(report)

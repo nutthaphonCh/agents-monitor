@@ -13,8 +13,8 @@ All tools use the Python 3 standard library or macOS system commands. Agent cred
 ## Install from a release tar
 
 ```sh
-tar -xzf tools-0.3.5.tar.gz
-cd tools-0.3.5
+tar -xzf tools-0.4.0.tar.gz
+cd tools-0.4.0
 scripts/install.sh
 ```
 
@@ -31,10 +31,10 @@ Download the public release tar and checksum, verify them, then install:
 
 ```sh
 curl --proto '=https' --tlsv1.2 --fail --location --remote-name-all \
-  https://github.com/nutthaphonCh/agents-monitor/releases/download/v0.3.5/{tools-0.3.5.tar.gz,SHA256SUMS}
+  https://github.com/nutthaphonCh/agents-monitor/releases/download/v0.4.0/{tools-0.4.0.tar.gz,SHA256SUMS}
 shasum -a 256 -c SHA256SUMS
-tar -xzf tools-0.3.5.tar.gz
-tools-0.3.5/scripts/install.sh
+tar -xzf tools-0.4.0.tar.gz
+tools-0.4.0/scripts/install.sh
 ```
 
 The release archive contains no agent credentials or session data.
@@ -75,7 +75,7 @@ Search input uses the terminal's Unicode-aware character API, so `/` accepts Tha
 
 On the Overall page only, `p` (or `P`) exports the same report as a single, self-contained offline HTML file — inline CSS, no external assets or network requests — to `~/Library/Caches/execution-profiler/overall-report.html`, opens it in the default browser, and shows the saved path in the bottom-right status area for 10 seconds. The project ranking itself is expandable in HTML, so model/session/file details live in one list rather than a duplicated second section. Everywhere else, `p` keeps its normal meaning: background processes for the selected prompt/session.
 
-The scoring policy and its limitations are documented in [docs/consumption-score.md](docs/consumption-score.md). The observed Codex thread/rollout/shard model and aggregation rules are documented separately in [docs/codex-session-storage.md](docs/codex-session-storage.md).
+The scoring policy and its limitations are documented in [docs/consumption-score.md](docs/consumption-score.md). The observed Codex thread/rollout/shard model and aggregation rules are documented separately in [docs/codex-session-storage.md](docs/codex-session-storage.md). Runtime module boundaries and the test strategy are documented in [docs/architecture.md](docs/architecture.md).
 
 ## Detach mode
 
@@ -95,6 +95,6 @@ The range switch (Today / 7d / 30d / 90d) and the unit switch (consumption score
 ## Development
 
 ```sh
-python3 -m unittest tests.test_monitoring
-scripts/build-release.sh 0.3.5
+python3 -m unittest discover -s tests
+scripts/build-release.sh 0.4.0
 ```

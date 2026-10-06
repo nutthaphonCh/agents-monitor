@@ -12,6 +12,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 FILES = (
     "README.md",
+    "agent_monitor/__init__.py",
+    "agent_monitor/dashboard.py",
+    "agent_monitor/models.py",
+    "agent_monitor/parsers.py",
+    "agent_monitor/tui.py",
+    "agent_monitor/updater.py",
+    "agent_monitor/views.py",
+    "docs/architecture.md",
     "docs/codex-session-storage.md",
     "docs/consumption-score.md",
     "monitoring.py",
