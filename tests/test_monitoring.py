@@ -1,5 +1,7 @@
 import json
 import fcntl
+import hashlib
+import io
 import os
 import pty
 import select
@@ -7,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import tarfile
 import termios
 import threading
 import time
@@ -192,6 +195,75 @@ class SessionFixture:
         os.unlink(self.path)
 
 
+class SelfUpdateTests(unittest.TestCase):
+    @staticmethod
+    def release_archive(version="9.8.7"):
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w:gz") as archive:
+            data = b"#!/bin/sh\nexit 0\n"
+            info = tarfile.TarInfo(f"tools-{version}/scripts/install.sh")
+            info.mode, info.size = 0o755, len(data)
+            archive.addfile(info, io.BytesIO(data))
+        return output.getvalue()
+
+    def test_current_release_is_not_reinstalled(self):
+        output = io.StringIO()
+        with (
+            mock.patch.object(monitoring, "latest_release_assets", return_value=(monitoring.VERSION, {})),
+            mock.patch.object(sys, "stdout", output),
+            mock.patch.object(monitoring.subprocess, "run") as run,
+        ):
+            monitoring.update_agent_monitor()
+        self.assertIn("already up to date", output.getvalue())
+        run.assert_not_called()
+
+    def test_update_verifies_archive_and_runs_installer_for_requested_prefix(self):
+        version = "9.8.7"
+        archive = self.release_archive(version)
+        digest = hashlib.sha256(archive).hexdigest()
+        assets = {
+            f"tools-{version}.tar.gz": "https://example.test/archive",
+            "SHA256SUMS": "https://example.test/checksum",
+        }
+
+        def fetch(url, _accept):
+            if url == assets[f"tools-{version}.tar.gz"]:
+                return archive
+            return f"{digest}  tools-{version}.tar.gz\n".encode()
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                mock.patch.object(monitoring, "latest_release_assets", return_value=(version, assets)),
+                mock.patch.object(monitoring, "release_request", side_effect=fetch),
+                mock.patch.object(monitoring.subprocess, "run") as run,
+            ):
+                prefix = Path(directory) / "prefix"
+                monitoring.update_agent_monitor(prefix=prefix)
+                command = run.call_args.args[0]
+                self.assertTrue(command[0].endswith(f"tools-{version}/scripts/install.sh"))
+                self.assertEqual(command[1:], ["--prefix", str(prefix)])
+                self.assertTrue(run.call_args.kwargs["check"])
+
+    def test_update_rejects_a_checksum_mismatch(self):
+        version = "9.8.7"
+        archive = self.release_archive(version)
+        assets = {
+            f"tools-{version}.tar.gz": "https://example.test/archive",
+            "SHA256SUMS": "https://example.test/checksum",
+        }
+        with (
+            mock.patch.object(monitoring, "latest_release_assets", return_value=(version, assets)),
+            mock.patch.object(
+                monitoring, "release_request",
+                side_effect=[archive, ("0" * 64 + f"  tools-{version}.tar.gz\n").encode()],
+            ),
+            mock.patch.object(monitoring.subprocess, "run") as run,
+            self.assertRaisesRegex(ValueError, "SHA-256 verification failed"),
+        ):
+            monitoring.update_agent_monitor()
+        run.assert_not_called()
+
+
 class SessionDiscoveryTests(unittest.TestCase):
     @staticmethod
     def write_codex_rollout(path, chat_id, source="user"):
@@ -244,6 +316,14 @@ class SessionDiscoveryTests(unittest.TestCase):
             check=True, capture_output=True, text=True,
         )
         self.assertEqual(result.stdout.strip(), f"agent-monitor {monitoring.VERSION}")
+
+    def test_update_command_runs_without_a_tty(self):
+        with (
+            mock.patch.object(sys, "argv", ["agent-monitor", "update"]),
+            mock.patch.object(monitoring, "update_agent_monitor") as update,
+        ):
+            monitoring.main()
+        update.assert_called_once_with(force=False)
 
     def test_codex_chats_follow_recency_and_current_rollout_path(self):
         with tempfile.TemporaryDirectory() as directory:

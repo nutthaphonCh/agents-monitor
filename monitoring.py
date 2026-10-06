@@ -42,6 +42,7 @@ import copy
 import curses
 import datetime as dt
 import glob
+import hashlib
 import html
 import json
 import os
@@ -50,10 +51,14 @@ import shlex
 import sqlite3
 import subprocess
 import sys
+import tarfile
+import tempfile
 import textwrap
 import threading
 import time
 import unicodedata
+import urllib.error
+import urllib.request
 
 from collections import Counter
 from dataclasses import dataclass, field, fields, is_dataclass
@@ -64,7 +69,9 @@ from typing import Any, Callable
 
 REFRESH_INTERVAL = 0.5
 CACHE_SCHEMA_VERSION = 15
-VERSION = "0.3.4"
+VERSION = "0.3.5"
+RELEASE_REPOSITORY = "nutthaphonCh/agents-monitor"
+LATEST_RELEASE_API = f"https://api.github.com/repos/{RELEASE_REPOSITORY}/releases/latest"
 ESCAPE_DELAY_MS = 25
 ACTION_NAMES = (
     "WebSearch", "WebFetch", "Bash", "Write", "Edit", "Read", "Glob", "Grep", "Search",
@@ -5259,17 +5266,114 @@ def print_session_list(limit: int) -> None:
         )
 
 
+def semantic_version(value: str) -> tuple[int, int, int]:
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", value.strip())
+    if not match:
+        raise ValueError(f"invalid release version: {value}")
+    return tuple(map(int, match.groups()))
+
+
+def update_install_prefix() -> Path:
+    """Reuse the prefix of an installed copy, or the documented default."""
+    source = Path(__file__).resolve()
+    if source.parent.name == "nutthaphon-tools" and source.parent.parent.name == "lib":
+        return source.parents[2]
+    return Path.home() / ".local"
+
+
+def release_request(url: str, accept: str) -> bytes:
+    request = urllib.request.Request(url, headers={
+        "Accept": accept,
+        "User-Agent": f"agent-monitor/{VERSION}",
+    })
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return response.read()
+
+
+def latest_release_assets() -> tuple[str, dict[str, str]]:
+    payload = json.loads(release_request(LATEST_RELEASE_API, "application/vnd.github+json"))
+    tag = str(payload.get("tag_name") or "") if isinstance(payload, dict) else ""
+    semantic_version(tag)
+    assets = {
+        str(item.get("name")): str(item.get("browser_download_url"))
+        for item in payload.get("assets", [])
+        if isinstance(item, dict) and item.get("name") and item.get("browser_download_url")
+    }
+    return tag.removeprefix("v"), assets
+
+
+def safe_extract_release(archive_path: Path, destination: Path, version: str) -> Path:
+    root = f"tools-{version}"
+    with tarfile.open(archive_path, "r:gz") as archive:
+        members = archive.getmembers()
+        for member in members:
+            parts = Path(member.name).parts
+            if (
+                not parts or parts[0] != root or ".." in parts
+                or Path(member.name).is_absolute() or member.issym() or member.islnk()
+                or member.isdev()
+            ):
+                raise ValueError(f"unsafe release archive member: {member.name}")
+        try:
+            archive.extractall(destination, members=members, filter="data")
+        except TypeError:  # Python < 3.12; members were checked above.
+            archive.extractall(destination, members=members)
+    installer = destination / root / "scripts" / "install.sh"
+    if not installer.is_file():
+        raise ValueError("release archive does not contain scripts/install.sh")
+    return installer
+
+
+def update_agent_monitor(force: bool = False, prefix: Path | None = None) -> None:
+    latest, assets = latest_release_assets()
+    if not force and semantic_version(latest) <= semantic_version(VERSION):
+        print(f"agent-monitor {VERSION} is already up to date")
+        return
+
+    archive_name = f"tools-{latest}.tar.gz"
+    missing = [name for name in (archive_name, "SHA256SUMS") if name not in assets]
+    if missing:
+        raise ValueError(f"release v{latest} is missing: {', '.join(missing)}")
+
+    with tempfile.TemporaryDirectory(prefix="agent-monitor-update-") as temp_value:
+        temp_dir = Path(temp_value)
+        archive_path = temp_dir / archive_name
+        archive_path.write_bytes(release_request(assets[archive_name], "application/octet-stream"))
+        checksum_text = release_request(assets["SHA256SUMS"], "application/octet-stream").decode("utf-8")
+        expected = next((
+            match.group(1).lower()
+            for line in checksum_text.splitlines()
+            if (match := re.fullmatch(r"([0-9a-fA-F]{64})\s+\*?" + re.escape(archive_name), line.strip()))
+        ), "")
+        actual = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+        if not expected or actual != expected:
+            raise ValueError(f"SHA-256 verification failed for {archive_name}")
+        installer = safe_extract_release(archive_path, temp_dir, latest)
+        install_prefix = prefix or update_install_prefix()
+        subprocess.run([str(installer), "--prefix", str(install_prefix)], check=True)
+    print(f"updated agent-monitor {VERSION} -> {latest}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Live TTY execution profiler for Claude Code and Codex JSONL sessions.")
     parser.add_argument("-v", "--version", action="version", version=f"agent-monitor {VERSION}")
-    parser.add_argument("target", nargs="?", help="Session JSONL or project directory")
+    parser.add_argument("target", nargs="?", help="Session JSONL, project directory, or 'update'")
     parser.add_argument("--list", action="store_true", help="List recent sessions")
     parser.add_argument("--list-limit", type=int, default=20)
+    parser.add_argument("--force-update", action="store_true", help="Reinstall the latest release")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
+    if args.target == "update":
+        try:
+            update_agent_monitor(force=args.force_update)
+        except (OSError, ValueError, KeyError, json.JSONDecodeError, urllib.error.URLError,
+                subprocess.CalledProcessError) as exc:
+            raise SystemExit(f"update failed: {exc}") from exc
+        return
 
     if args.list:
         print_session_list(args.list_limit)

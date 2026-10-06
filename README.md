@@ -13,8 +13,8 @@ All tools use the Python 3 standard library or macOS system commands. Agent cred
 ## Install from a release tar
 
 ```sh
-tar -xzf tools-0.3.4.tar.gz
-cd tools-0.3.4
+tar -xzf tools-0.3.5.tar.gz
+cd tools-0.3.5
 scripts/install.sh
 ```
 
@@ -31,13 +31,23 @@ Download the public release tar and checksum, verify them, then install:
 
 ```sh
 curl --proto '=https' --tlsv1.2 --fail --location --remote-name-all \
-  https://github.com/nutthaphonCh/agents-monitor/releases/download/v0.3.4/{tools-0.3.4.tar.gz,SHA256SUMS}
+  https://github.com/nutthaphonCh/agents-monitor/releases/download/v0.3.5/{tools-0.3.5.tar.gz,SHA256SUMS}
 shasum -a 256 -c SHA256SUMS
-tar -xzf tools-0.3.4.tar.gz
-tools-0.3.4/scripts/install.sh
+tar -xzf tools-0.3.5.tar.gz
+tools-0.3.5/scripts/install.sh
 ```
 
 The release archive contains no agent credentials or session data.
+
+## Update an installed copy
+
+```sh
+agent-monitor update
+```
+
+The updater checks the latest GitHub release, verifies the release archive against its
+published SHA-256 checksum, and reinstalls into the current installation prefix. Use
+`agent-monitor update --force-update` to reinstall the latest version.
 
 ## Background processes
 
@@ -86,5 +96,5 @@ The range switch (Today / 7d / 30d / 90d) and the unit switch (consumption score
 
 ```sh
 python3 -m unittest tests.test_monitoring
-scripts/build-release.sh 0.3.4
+scripts/build-release.sh 0.3.5
 ```
